@@ -79,13 +79,7 @@ app.post("/login", async (req, res) => {
   res.json({ success: true, user });
 });
 
-// Get crimes
-app.get("/crimes", async (req, res) => {
-  const result = await pool.query(`SELECT * FROM crimes`);
-  res.json(result.rows);
-});
-
-// Commit crime
+// Commit crime with cooldown
 app.post("/commit-crime", async (req, res) => {
   const { userId, crimeId } = req.body;
 
@@ -96,11 +90,7 @@ app.post("/commit-crime", async (req, res) => {
 
   // Check jail
   if (user.jail_until && new Date(user.jail_until) > new Date()) {
-    return res.json({
-      success: false,
-      error: "You are in jail",
-      jail_until: user.jail_until
-    });
+    return res.json({ success: false, message: "You are in jail!", jail_until: user.jail_until });
   }
 
   // Get crime
@@ -108,32 +98,32 @@ app.post("/commit-crime", async (req, res) => {
   if (crimeResult.rows.length === 0) return res.status(404).json({ error: "Crime not found" });
   const crime = crimeResult.rows[0];
 
-  // Roll success
+  // Check cooldown
+  if (user.last_crime && new Date(user.last_crime).getTime() + (crime.cooldown_seconds * 1000) > Date.now()) {
+    const waitTime = Math.ceil(
+      (user.last_crime.getTime() + crime.cooldown_seconds * 1000 - Date.now()) / 1000
+    );
+    return res.json({ success: false, message: `You must wait ${waitTime}s before committing another crime.`, cooldown: waitTime });
+  }
+
+  // Roll success/fail
   const success = Math.random() < crime.success_rate;
   let reward = 0;
   let jail_until = null;
 
   if (success) {
-    // Calculate reward
     reward = Math.floor(Math.random() * (crime.max_reward - crime.min_reward + 1)) + crime.min_reward;
-
     await pool.query(
       `UPDATE users 
-       SET money = money + $1, 
-           total_crimes = total_crimes + 1, 
-           successful_crimes = successful_crimes + 1
+       SET money = money + $1, total_crimes = total_crimes + 1, successful_crimes = successful_crimes + 1, last_crime = NOW()
        WHERE id = $2`,
       [reward, userId]
     );
   } else {
-    // Send to jail
-    jail_until = new Date(Date.now() + (crime.cooldown_seconds * 1000));
-
+    jail_until = new Date(Date.now() + crime.cooldown_seconds * 1000);
     await pool.query(
       `UPDATE users 
-       SET total_crimes = total_crimes + 1, 
-           unsuccessful_crimes = unsuccessful_crimes + 1,
-           jail_until = $1
+       SET total_crimes = total_crimes + 1, unsuccessful_crimes = unsuccessful_crimes + 1, jail_until = $1, last_crime = NOW()
        WHERE id = $2`,
       [jail_until, userId]
     );
@@ -153,10 +143,12 @@ app.post("/commit-crime", async (req, res) => {
 });
 
 
+
 // ✅ Homepage route
 app.get("/", (req, res) => {
   res.send("✅ Mafia Game API is running! Try /crimes");
 });
 
 app.listen(4000, () => console.log("Server running on http://localhost:4000"));
+
 
