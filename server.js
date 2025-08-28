@@ -11,7 +11,7 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// Connect to Postgres using environment variable from Render
+// Connect to Postgres
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
@@ -24,7 +24,7 @@ async function initDB() {
     username TEXT UNIQUE,
     password TEXT,
     money INTEGER DEFAULT 0,
-    points INTEGER DEFAULT 0,
+    bank_balance INTEGER DEFAULT 0,
     total_crimes INTEGER DEFAULT 0,
     successful_crimes INTEGER DEFAULT 0,
     unsuccessful_crimes INTEGER DEFAULT 0,
@@ -41,24 +41,72 @@ async function initDB() {
     cooldown_seconds INTEGER
   )`);
 
+  await pool.query(`CREATE TABLE IF NOT EXISTS cars (
+    id SERIAL PRIMARY KEY,
+    name TEXT,
+    price INTEGER
+  )`);
+
+  await pool.query(`CREATE TABLE IF NOT EXISTS user_cars (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    car_id INTEGER REFERENCES cars(id) ON DELETE CASCADE
+  )`);
+
+  await pool.query(`CREATE TABLE IF NOT EXISTS properties (
+    id SERIAL PRIMARY KEY,
+    name TEXT,
+    price INTEGER,
+    income_per_hour INTEGER
+  )`);
+
+  await pool.query(`CREATE TABLE IF NOT EXISTS user_properties (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    property_id INTEGER REFERENCES properties(id) ON DELETE CASCADE
+  )`);
+
   // Insert starter crimes if none exist
-  const { rows } = await pool.query("SELECT COUNT(*) FROM crimes");
-  if (parseInt(rows[0].count) === 0) {
-    await pool.query(
-      `INSERT INTO crimes (name, min_reward, max_reward, success_rate, cooldown_seconds)
-       VALUES 
-       ('Beg on the streets', 1, 10, 0.9, 10),
-       ('Pickpocket someone', 5, 20, 0.75, 20),
-       ('Rob a small shop', 20, 100, 0.6, 30),
-       ('Car theft', 100, 500, 0.4, 60),
-       ('Bank heist', 1000, 5000, 0.2, 120)`
-    );
+  const crimesCount = await pool.query("SELECT COUNT(*) FROM crimes");
+  if (parseInt(crimesCount.rows[0].count) === 0) {
+    await pool.query(`
+      INSERT INTO crimes (name, min_reward, max_reward, success_rate, cooldown_seconds)
+      VALUES
+      ('Beg on the streets', 1, 10, 0.9, 10),
+      ('Pickpocket someone', 5, 20, 0.75, 20),
+      ('Rob a small shop', 20, 100, 0.6, 30),
+      ('Car theft', 100, 500, 0.4, 60),
+      ('Bank heist', 1000, 5000, 0.2, 120)
+    `);
+  }
+
+  // Insert cars
+  const carsCount = await pool.query("SELECT COUNT(*) FROM cars");
+  if (parseInt(carsCount.rows[0].count) === 0) {
+    await pool.query(`
+      INSERT INTO cars (name, price) VALUES
+      ('Stolen Bike', 100),
+      ('Used Sedan', 1000),
+      ('Sports Car', 10000),
+      ('Armored Truck', 50000)
+    `);
+  }
+
+  // Insert properties
+  const propsCount = await pool.query("SELECT COUNT(*) FROM properties");
+  if (parseInt(propsCount.rows[0].count) === 0) {
+    await pool.query(`
+      INSERT INTO properties (name, price, income_per_hour) VALUES
+      ('Bullet Factory', 10000, 500),
+      ('Casino', 50000, 3000),
+      ('Nightclub', 20000, 1200)
+    `);
   }
 }
 
 initDB();
 
-// Register
+// --- Auth ---
 app.post("/register", async (req, res) => {
   const { username, password } = req.body;
   try {
@@ -73,7 +121,6 @@ app.post("/register", async (req, res) => {
   }
 });
 
-// Login
 app.post("/login", async (req, res) => {
   const { username, password } = req.body;
   const result = await pool.query(`SELECT * FROM users WHERE username = $1`, [username]);
@@ -86,84 +133,102 @@ app.post("/login", async (req, res) => {
   res.json({ success: true, user });
 });
 
-// ✅ Get crimes
+// --- Crimes ---
 app.get("/crimes", async (req, res) => {
-  try {
-    const result = await pool.query(`SELECT * FROM crimes ORDER BY id ASC`);
-    res.json(result.rows);
-  } catch (err) {
-    console.error("Error fetching crimes:", err);
-    res.status(500).json({ error: "Failed to fetch crimes" });
-  }
+  const result = await pool.query(`SELECT * FROM crimes ORDER BY id ASC`);
+  res.json(result.rows);
 });
 
-// Commit crime with cooldown
 app.post("/commit-crime", async (req, res) => {
   const { userId, crimeId } = req.body;
-
-  // Get user
-  const userResult = await pool.query(`SELECT * FROM users WHERE id = $1`, [userId]);
+  const userResult = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
   if (userResult.rows.length === 0) return res.status(404).json({ error: "User not found" });
   const user = userResult.rows[0];
 
-  // Check jail
-  if (user.jail_until && new Date(user.jail_until) > new Date()) {
-    return res.json({ success: false, message: "You are in jail!", jail_until: user.jail_until });
-  }
-
-  // Get crime
-  const crimeResult = await pool.query(`SELECT * FROM crimes WHERE id = $1`, [crimeId]);
+  const crimeResult = await pool.query(`SELECT * FROM crimes WHERE id=$1`, [crimeId]);
   if (crimeResult.rows.length === 0) return res.status(404).json({ error: "Crime not found" });
   const crime = crimeResult.rows[0];
 
-  // Check cooldown
-  if (user.last_crime && new Date(user.last_crime).getTime() + (crime.cooldown_seconds * 1000) > Date.now()) {
-    const waitTime = Math.ceil(
-      (new Date(user.last_crime).getTime() + crime.cooldown_seconds * 1000 - Date.now()) / 1000
-    );
-    return res.json({ success: false, message: `You must wait ${waitTime}s before committing another crime.`, cooldown: waitTime });
-  }
-
-  // Roll success/fail
   const success = Math.random() < crime.success_rate;
   let reward = 0;
-  let jail_until = null;
-
   if (success) {
     reward = Math.floor(Math.random() * (crime.max_reward - crime.min_reward + 1)) + crime.min_reward;
     await pool.query(
-      `UPDATE users 
-       SET money = money + $1, total_crimes = total_crimes + 1, successful_crimes = successful_crimes + 1, last_crime = NOW()
-       WHERE id = $2`,
+      `UPDATE users SET money = money + $1, total_crimes = total_crimes+1, successful_crimes=successful_crimes+1 WHERE id=$2`,
       [reward, userId]
     );
   } else {
-    jail_until = new Date(Date.now() + crime.cooldown_seconds * 1000);
+    const jail_until = new Date(Date.now() + crime.cooldown_seconds * 1000);
     await pool.query(
-      `UPDATE users 
-       SET total_crimes = total_crimes + 1, unsuccessful_crimes = unsuccessful_crimes + 1, jail_until = $1, last_crime = NOW()
-       WHERE id = $2`,
+      `UPDATE users SET total_crimes = total_crimes+1, unsuccessful_crimes=unsuccessful_crimes+1, jail_until=$1 WHERE id=$2`,
       [jail_until, userId]
     );
   }
 
-  // Return updated user
-  const updatedUser = await pool.query(`SELECT * FROM users WHERE id = $1`, [userId]);
-
-  res.json({
-    success,
-    reward,
-    message: success
-      ? `You earned $${reward}!`
-      : `You failed and are jailed for ${crime.cooldown_seconds} seconds.`,
-    user: updatedUser.rows[0]
-  });
+  const updatedUser = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
+  res.json({ success, reward, user: updatedUser.rows[0] });
 });
 
-// ✅ Homepage route
+// --- Bank ---
+app.post("/bank/deposit", async (req, res) => {
+  const { userId, amount } = req.body;
+  await pool.query(`UPDATE users SET money=money-$1, bank_balance=bank_balance+$1 WHERE id=$2 AND money >= $1`, [amount, userId]);
+  const updatedUser = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
+  res.json(updatedUser.rows[0]);
+});
+
+app.post("/bank/withdraw", async (req, res) => {
+  const { userId, amount } = req.body;
+  await pool.query(`UPDATE users SET bank_balance=bank_balance-$1, money=money+$1 WHERE id=$2 AND bank_balance >= $1`, [amount, userId]);
+  const updatedUser = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
+  res.json(updatedUser.rows[0]);
+});
+
+// --- Garage ---
+app.get("/cars", async (req, res) => {
+  const result = await pool.query(`SELECT * FROM cars ORDER BY price ASC`);
+  res.json(result.rows);
+});
+
+app.post("/garage/buy", async (req, res) => {
+  const { userId, carId } = req.body;
+  const car = await pool.query(`SELECT * FROM cars WHERE id=$1`, [carId]);
+  if (car.rows.length === 0) return res.status(404).json({ error: "Car not found" });
+  const price = car.rows[0].price;
+
+  await pool.query(`UPDATE users SET money=money-$1 WHERE id=$2 AND money >= $1`, [price, userId]);
+  await pool.query(`INSERT INTO user_cars (user_id, car_id) VALUES ($1,$2)`, [userId, carId]);
+  const updatedCars = await pool.query(
+    `SELECT c.* FROM user_cars uc JOIN cars c ON uc.car_id=c.id WHERE uc.user_id=$1`,
+    [userId]
+  );
+  res.json(updatedCars.rows);
+});
+
+// --- Properties ---
+app.get("/properties", async (req, res) => {
+  const result = await pool.query(`SELECT * FROM properties ORDER BY price ASC`);
+  res.json(result.rows);
+});
+
+app.post("/properties/buy", async (req, res) => {
+  const { userId, propertyId } = req.body;
+  const property = await pool.query(`SELECT * FROM properties WHERE id=$1`, [propertyId]);
+  if (property.rows.length === 0) return res.status(404).json({ error: "Property not found" });
+  const price = property.rows[0].price;
+
+  await pool.query(`UPDATE users SET money=money-$1 WHERE id=$2 AND money >= $1`, [price, userId]);
+  await pool.query(`INSERT INTO user_properties (user_id, property_id) VALUES ($1,$2)`, [userId, propertyId]);
+  const updatedProps = await pool.query(
+    `SELECT p.* FROM user_properties up JOIN properties p ON up.property_id=p.id WHERE up.user_id=$1`,
+    [userId]
+  );
+  res.json(updatedProps.rows);
+});
+
+// Root
 app.get("/", (req, res) => {
-  res.send("✅ Mafia Game API is running! Try /crimes");
+  res.send("✅ Mafia Game API running. Try /crimes, /cars, /properties");
 });
 
-// Start server
 app.listen(4000, () => console.log("Server running on http://localhost:4000"));
