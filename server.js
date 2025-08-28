@@ -39,6 +39,16 @@ async function initDB() {
     boss_id INTEGER REFERENCES users(id)
   )`);
 
+  await pool.query(`CREATE TABLE IF NOT EXISTS gang_wars (
+    id SERIAL PRIMARY KEY,
+    gang_a INTEGER REFERENCES gangs(id),
+    gang_b INTEGER REFERENCES gangs(id),
+    winner INTEGER,
+    loser INTEGER,
+    bullets_used INTEGER,
+    war_time TIMESTAMP DEFAULT NOW()
+  )`);
+
   await pool.query(`CREATE TABLE IF NOT EXISTS crimes (
     id SERIAL PRIMARY KEY,
     name TEXT,
@@ -217,15 +227,36 @@ app.post("/gang/war", async (req, res) => {
 
   await pool.query(`UPDATE users SET bullets=bullets-$1 WHERE id=$2`, [bulletsUsed, initiatorId]);
 
-  const chance = Math.min(0.9, bulletsUsed / 500); // 500 bullets = max 90%
+  const chance = Math.min(0.9, bulletsUsed / 500);
   const win = Math.random() < chance;
 
   if (win) {
     await pool.query(`UPDATE gangs SET boss_id=$1 WHERE id=$2`, [initiatorId, gangB]);
+    await pool.query(
+      `INSERT INTO gang_wars (gang_a, gang_b, winner, loser, bullets_used) VALUES ($1,$2,$3,$4,$5)`,
+      [gangA, gangB, gangA, gangB, bulletsUsed]
+    );
     res.json({ success: true, message: `Gang ${gangA} defeated ${gangB}! Turf captured.` });
   } else {
+    await pool.query(
+      `INSERT INTO gang_wars (gang_a, gang_b, winner, loser, bullets_used) VALUES ($1,$2,$3,$4,$5)`,
+      [gangA, gangB, gangB, gangA, bulletsUsed]
+    );
     res.json({ success: false, message: "Gang war lost! Bullets wasted." });
   }
+});
+
+app.get("/gang/wars", async (_, res) => {
+  const wars = await pool.query(`
+    SELECT gw.id, gw.war_time, g1.name AS gang_a, g2.name AS gang_b,
+           gw.winner, gw.loser, gw.bullets_used
+    FROM gang_wars gw
+    LEFT JOIN gangs g1 ON gw.gang_a=g1.id
+    LEFT JOIN gangs g2 ON gw.gang_b=g2.id
+    ORDER BY gw.war_time DESC
+    LIMIT 20
+  `);
+  res.json(wars.rows);
 });
 
 // Root
