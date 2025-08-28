@@ -89,28 +89,69 @@ app.get("/crimes", async (req, res) => {
 app.post("/commit-crime", async (req, res) => {
   const { userId, crimeId } = req.body;
 
+  // Get user
   const userResult = await pool.query(`SELECT * FROM users WHERE id = $1`, [userId]);
   if (userResult.rows.length === 0) return res.status(404).json({ error: "User not found" });
   const user = userResult.rows[0];
 
+  // Check jail
+  if (user.jail_until && new Date(user.jail_until) > new Date()) {
+    return res.json({
+      success: false,
+      error: "You are in jail",
+      jail_until: user.jail_until
+    });
+  }
+
+  // Get crime
   const crimeResult = await pool.query(`SELECT * FROM crimes WHERE id = $1`, [crimeId]);
   if (crimeResult.rows.length === 0) return res.status(404).json({ error: "Crime not found" });
   const crime = crimeResult.rows[0];
 
+  // Roll success
   const success = Math.random() < crime.success_rate;
-  const reward = success
-    ? Math.floor(Math.random() * (crime.max_reward - crime.min_reward + 1)) + crime.min_reward
-    : 0;
+  let reward = 0;
+  let jail_until = null;
 
-  await pool.query(
-    `UPDATE users SET money = money + $1, total_crimes = total_crimes + 1,
-     successful_crimes = successful_crimes + $2, unsuccessful_crimes = unsuccessful_crimes + $3
-     WHERE id = $4`,
-    [reward, success ? 1 : 0, success ? 0 : 1, userId]
-  );
+  if (success) {
+    // Calculate reward
+    reward = Math.floor(Math.random() * (crime.max_reward - crime.min_reward + 1)) + crime.min_reward;
 
-  res.json({ success, reward, newBalance: user.money + reward });
+    await pool.query(
+      `UPDATE users 
+       SET money = money + $1, 
+           total_crimes = total_crimes + 1, 
+           successful_crimes = successful_crimes + 1
+       WHERE id = $2`,
+      [reward, userId]
+    );
+  } else {
+    // Send to jail
+    jail_until = new Date(Date.now() + (crime.cooldown_seconds * 1000));
+
+    await pool.query(
+      `UPDATE users 
+       SET total_crimes = total_crimes + 1, 
+           unsuccessful_crimes = unsuccessful_crimes + 1,
+           jail_until = $1
+       WHERE id = $2`,
+      [jail_until, userId]
+    );
+  }
+
+  // Return updated user
+  const updatedUser = await pool.query(`SELECT * FROM users WHERE id = $1`, [userId]);
+
+  res.json({
+    success,
+    reward,
+    message: success
+      ? `You earned $${reward}!`
+      : `You failed and are jailed for ${crime.cooldown_seconds} seconds.`,
+    user: updatedUser.rows[0]
+  });
 });
+
 
 // ✅ Homepage route
 app.get("/", (req, res) => {
@@ -118,3 +159,4 @@ app.get("/", (req, res) => {
 });
 
 app.listen(4000, () => console.log("Server running on http://localhost:4000"));
+
