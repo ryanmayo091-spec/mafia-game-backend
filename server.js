@@ -1,4 +1,3 @@
-// backend/server.js
 import express from "express";
 import pkg from "pg";
 import bcrypt from "bcrypt";
@@ -11,13 +10,13 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// Connect to Postgres (Render gives you DATABASE_URL in env)
+// Connect to Postgres using environment variable from Render
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
-// Initialize tables
+// Initialize DB tables
 async function initDB() {
   await pool.query(`CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
@@ -39,7 +38,7 @@ async function initDB() {
     cooldown_seconds INTEGER
   )`);
 
-  // Insert starter crime if none
+  // Insert starter crime if none exist
   const { rows } = await pool.query("SELECT COUNT(*) FROM crimes");
   if (parseInt(rows[0].count) === 0) {
     await pool.query(
