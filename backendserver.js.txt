@@ -1,0 +1,116 @@
+// backend/server.js
+import express from "express";
+import pkg from "pg";
+import bcrypt from "bcrypt";
+import bodyParser from "body-parser";
+import cors from "cors";
+
+const { Pool } = pkg;
+const app = express();
+
+app.use(cors());
+app.use(bodyParser.json());
+
+// Connect to Postgres (Render gives you DATABASE_URL in env)
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
+// Initialize tables
+async function initDB() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS users (
+    id SERIAL PRIMARY KEY,
+    username TEXT UNIQUE,
+    password TEXT,
+    money INTEGER DEFAULT 0,
+    points INTEGER DEFAULT 0,
+    total_crimes INTEGER DEFAULT 0,
+    successful_crimes INTEGER DEFAULT 0,
+    unsuccessful_crimes INTEGER DEFAULT 0
+  )`);
+
+  await pool.query(`CREATE TABLE IF NOT EXISTS crimes (
+    id SERIAL PRIMARY KEY,
+    name TEXT,
+    min_reward INTEGER,
+    max_reward INTEGER,
+    success_rate REAL,
+    cooldown_seconds INTEGER
+  )`);
+
+  // Insert starter crime if none
+  const { rows } = await pool.query("SELECT COUNT(*) FROM crimes");
+  if (parseInt(rows[0].count) === 0) {
+    await pool.query(
+      `INSERT INTO crimes (name, min_reward, max_reward, success_rate, cooldown_seconds)
+       VALUES ($1, $2, $3, $4, $5)`,
+      ["Beg on the streets", 1, 10, 0.9, 10]
+    );
+  }
+}
+
+initDB();
+
+// Register
+app.post("/register", async (req, res) => {
+  const { username, password } = req.body;
+  try {
+    const hashed = await bcrypt.hash(password, 10);
+    const result = await pool.query(
+      `INSERT INTO users (username, password) VALUES ($1, $2) RETURNING id`,
+      [username, hashed]
+    );
+    res.json({ success: true, userId: result.rows[0].id });
+  } catch (err) {
+    res.status(400).json({ error: "Username taken" });
+  }
+});
+
+// Login
+app.post("/login", async (req, res) => {
+  const { username, password } = req.body;
+  const result = await pool.query(`SELECT * FROM users WHERE username = $1`, [username]);
+  if (result.rows.length === 0) return res.status(400).json({ error: "User not found" });
+
+  const user = result.rows[0];
+  const match = await bcrypt.compare(password, user.password);
+  if (!match) return res.status(401).json({ error: "Invalid password" });
+
+  res.json({ success: true, user });
+});
+
+// Get crimes
+app.get("/crimes", async (req, res) => {
+  const result = await pool.query(`SELECT * FROM crimes`);
+  res.json(result.rows);
+});
+
+// Commit crime
+app.post("/commit-crime", async (req, res) => {
+  const { userId, crimeId } = req.body;
+
+  const userResult = await pool.query(`SELECT * FROM users WHERE id = $1`, [userId]);
+  if (userResult.rows.length === 0) return res.status(404).json({ error: "User not found" });
+  const user = userResult.rows[0];
+
+  const crimeResult = await pool.query(`SELECT * FROM crimes WHERE id = $1`, [crimeId]);
+  if (crimeResult.rows.length === 0) return res.status(404).json({ error: "Crime not found" });
+  const crime = crimeResult.rows[0];
+
+  const success = Math.random() < crime.success_rate;
+  const reward = success
+    ? Math.floor(Math.random() * (crime.max_reward - crime.min_reward + 1)) + crime.min_reward
+    : 0;
+
+  await pool.query(
+    `UPDATE users SET money = money + $1, total_crimes = total_crimes + 1,
+     successful_crimes = successful_crimes + $2, unsuccessful_crimes = unsuccessful_crimes + $3
+     WHERE id = $4`,
+    [reward, success ? 1 : 0, success ? 0 : 1, userId]
+  );
+
+  res.json({ success, reward, newBalance: user.money + reward });
+});
+
+app.listen(4000, () => console.log("Server running on http://localhost:4000"));
