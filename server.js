@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import pkg from "pg";
 import bcrypt from "bcrypt";
@@ -26,7 +27,9 @@ async function initDB() {
     points INTEGER DEFAULT 0,
     total_crimes INTEGER DEFAULT 0,
     successful_crimes INTEGER DEFAULT 0,
-    unsuccessful_crimes INTEGER DEFAULT 0
+    unsuccessful_crimes INTEGER DEFAULT 0,
+    last_crime TIMESTAMP,
+    jail_until TIMESTAMP
   )`);
 
   await pool.query(`CREATE TABLE IF NOT EXISTS crimes (
@@ -38,13 +41,17 @@ async function initDB() {
     cooldown_seconds INTEGER
   )`);
 
-  // Insert starter crime if none exist
+  // Insert starter crimes if none exist
   const { rows } = await pool.query("SELECT COUNT(*) FROM crimes");
   if (parseInt(rows[0].count) === 0) {
     await pool.query(
       `INSERT INTO crimes (name, min_reward, max_reward, success_rate, cooldown_seconds)
-       VALUES ($1, $2, $3, $4, $5)`,
-      ["Beg on the streets", 1, 10, 0.9, 10]
+       VALUES 
+       ('Beg on the streets', 1, 10, 0.9, 10),
+       ('Pickpocket someone', 5, 20, 0.75, 20),
+       ('Rob a small shop', 20, 100, 0.6, 30),
+       ('Car theft', 100, 500, 0.4, 60),
+       ('Bank heist', 1000, 5000, 0.2, 120)`
     );
   }
 }
@@ -79,6 +86,17 @@ app.post("/login", async (req, res) => {
   res.json({ success: true, user });
 });
 
+// ✅ Get crimes
+app.get("/crimes", async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT * FROM crimes ORDER BY id ASC`);
+    res.json(result.rows);
+  } catch (err) {
+    console.error("Error fetching crimes:", err);
+    res.status(500).json({ error: "Failed to fetch crimes" });
+  }
+});
+
 // Commit crime with cooldown
 app.post("/commit-crime", async (req, res) => {
   const { userId, crimeId } = req.body;
@@ -101,7 +119,7 @@ app.post("/commit-crime", async (req, res) => {
   // Check cooldown
   if (user.last_crime && new Date(user.last_crime).getTime() + (crime.cooldown_seconds * 1000) > Date.now()) {
     const waitTime = Math.ceil(
-      (user.last_crime.getTime() + crime.cooldown_seconds * 1000 - Date.now()) / 1000
+      (new Date(user.last_crime).getTime() + crime.cooldown_seconds * 1000 - Date.now()) / 1000
     );
     return res.json({ success: false, message: `You must wait ${waitTime}s before committing another crime.`, cooldown: waitTime });
   }
@@ -142,13 +160,10 @@ app.post("/commit-crime", async (req, res) => {
   });
 });
 
-
-
 // ✅ Homepage route
 app.get("/", (req, res) => {
   res.send("✅ Mafia Game API is running! Try /crimes");
 });
 
+// Start server
 app.listen(4000, () => console.log("Server running on http://localhost:4000"));
-
-
