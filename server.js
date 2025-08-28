@@ -112,4 +112,9 @@ app.post("/commit-crime", async (req, res) => {
   res.json({ success, reward, newBalance: user.money + reward });
 });
 
+// ✅ Homepage route
+app.get("/", (req, res) => {
+  res.send("✅ Mafia Game API is running! Try /crimes");
+});
+
 app.listen(4000, () => console.log("Server running on http://localhost:4000"));
