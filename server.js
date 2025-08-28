@@ -53,20 +53,23 @@ async function initDB() {
     car_id INTEGER REFERENCES cars(id) ON DELETE CASCADE
   )`);
 
+  // 🔹 Properties
   await pool.query(`CREATE TABLE IF NOT EXISTS properties (
     id SERIAL PRIMARY KEY,
     name TEXT,
-    price INTEGER,
-    income_per_hour INTEGER
+    base_price INTEGER
   )`);
 
   await pool.query(`CREATE TABLE IF NOT EXISTS user_properties (
     id SERIAL PRIMARY KEY,
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    property_id INTEGER REFERENCES properties(id) ON DELETE CASCADE
+    property_id INTEGER REFERENCES properties(id) ON DELETE CASCADE,
+    owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    custom_price INTEGER,
+    is_for_sale BOOLEAN DEFAULT false,
+    sale_price INTEGER
   )`);
 
-  // Insert starter crimes if none exist
+  // Insert starter crimes
   const crimesCount = await pool.query("SELECT COUNT(*) FROM crimes");
   if (parseInt(crimesCount.rows[0].count) === 0) {
     await pool.query(`
@@ -96,14 +99,13 @@ async function initDB() {
   const propsCount = await pool.query("SELECT COUNT(*) FROM properties");
   if (parseInt(propsCount.rows[0].count) === 0) {
     await pool.query(`
-      INSERT INTO properties (name, price, income_per_hour) VALUES
-      ('Bullet Factory', 10000, 500),
-      ('Casino', 50000, 3000),
-      ('Nightclub', 20000, 1200)
+      INSERT INTO properties (name, base_price) VALUES
+      ('Bullet Factory', 10000),
+      ('Casino', 50000),
+      ('Nightclub', 20000)
     `);
   }
 }
-
 initDB();
 
 // --- Auth ---
@@ -139,96 +141,70 @@ app.get("/crimes", async (req, res) => {
   res.json(result.rows);
 });
 
-app.post("/commit-crime", async (req, res) => {
-  const { userId, crimeId } = req.body;
-  const userResult = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
-  if (userResult.rows.length === 0) return res.status(404).json({ error: "User not found" });
-  const user = userResult.rows[0];
-
-  const crimeResult = await pool.query(`SELECT * FROM crimes WHERE id=$1`, [crimeId]);
-  if (crimeResult.rows.length === 0) return res.status(404).json({ error: "Crime not found" });
-  const crime = crimeResult.rows[0];
-
-  const success = Math.random() < crime.success_rate;
-  let reward = 0;
-  if (success) {
-    reward = Math.floor(Math.random() * (crime.max_reward - crime.min_reward + 1)) + crime.min_reward;
-    await pool.query(
-      `UPDATE users SET money = money + $1, total_crimes = total_crimes+1, successful_crimes=successful_crimes+1 WHERE id=$2`,
-      [reward, userId]
-    );
-  } else {
-    const jail_until = new Date(Date.now() + crime.cooldown_seconds * 1000);
-    await pool.query(
-      `UPDATE users SET total_crimes = total_crimes+1, unsuccessful_crimes=unsuccessful_crimes+1, jail_until=$1 WHERE id=$2`,
-      [jail_until, userId]
-    );
-  }
-
-  const updatedUser = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
-  res.json({ success, reward, user: updatedUser.rows[0] });
-});
-
-// --- Bank ---
-app.post("/bank/deposit", async (req, res) => {
-  const { userId, amount } = req.body;
-  await pool.query(`UPDATE users SET money=money-$1, bank_balance=bank_balance+$1 WHERE id=$2 AND money >= $1`, [amount, userId]);
-  const updatedUser = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
-  res.json(updatedUser.rows[0]);
-});
-
-app.post("/bank/withdraw", async (req, res) => {
-  const { userId, amount } = req.body;
-  await pool.query(`UPDATE users SET bank_balance=bank_balance-$1, money=money+$1 WHERE id=$2 AND bank_balance >= $1`, [amount, userId]);
-  const updatedUser = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
-  res.json(updatedUser.rows[0]);
-});
-
-// --- Garage ---
-app.get("/cars", async (req, res) => {
-  const result = await pool.query(`SELECT * FROM cars ORDER BY price ASC`);
-  res.json(result.rows);
-});
-
-app.post("/garage/buy", async (req, res) => {
-  const { userId, carId } = req.body;
-  const car = await pool.query(`SELECT * FROM cars WHERE id=$1`, [carId]);
-  if (car.rows.length === 0) return res.status(404).json({ error: "Car not found" });
-  const price = car.rows[0].price;
-
-  await pool.query(`UPDATE users SET money=money-$1 WHERE id=$2 AND money >= $1`, [price, userId]);
-  await pool.query(`INSERT INTO user_cars (user_id, car_id) VALUES ($1,$2)`, [userId, carId]);
-  const updatedCars = await pool.query(
-    `SELECT c.* FROM user_cars uc JOIN cars c ON uc.car_id=c.id WHERE uc.user_id=$1`,
-    [userId]
-  );
-  res.json(updatedCars.rows);
-});
-
 // --- Properties ---
 app.get("/properties", async (req, res) => {
-  const result = await pool.query(`SELECT * FROM properties ORDER BY price ASC`);
+  const result = await pool.query(`
+    SELECT p.id, p.name, p.base_price, up.owner_id, up.custom_price, up.is_for_sale, up.sale_price
+    FROM properties p
+    LEFT JOIN user_properties up ON p.id = up.property_id
+  `);
   res.json(result.rows);
 });
 
+// Buy property (from system or marketplace)
 app.post("/properties/buy", async (req, res) => {
   const { userId, propertyId } = req.body;
+
   const property = await pool.query(`SELECT * FROM properties WHERE id=$1`, [propertyId]);
   if (property.rows.length === 0) return res.status(404).json({ error: "Property not found" });
-  const price = property.rows[0].price;
 
-  await pool.query(`UPDATE users SET money=money-$1 WHERE id=$2 AND money >= $1`, [price, userId]);
-  await pool.query(`INSERT INTO user_properties (user_id, property_id) VALUES ($1,$2)`, [userId, propertyId]);
-  const updatedProps = await pool.query(
-    `SELECT p.* FROM user_properties up JOIN properties p ON up.property_id=p.id WHERE up.user_id=$1`,
-    [userId]
-  );
-  res.json(updatedProps.rows);
+  const basePrice = property.rows[0].base_price;
+
+  // Check if already owned
+  const owned = await pool.query(`SELECT * FROM user_properties WHERE property_id=$1`, [propertyId]);
+  if (owned.rows.length > 0) {
+    const prop = owned.rows[0];
+    if (!prop.is_for_sale) return res.status(400).json({ error: "Property not for sale" });
+
+    // Transfer ownership
+    await pool.query(`UPDATE users SET money = money - $1 WHERE id=$2 AND money >= $1`, [prop.sale_price, userId]);
+    await pool.query(`UPDATE users SET money = money + $1 WHERE id=$2`, [prop.sale_price, prop.owner_id]);
+    await pool.query(`UPDATE user_properties SET owner_id=$1, is_for_sale=false, sale_price=NULL WHERE property_id=$2`, [userId, propertyId]);
+  } else {
+    // Buy from system
+    await pool.query(`UPDATE users SET money = money - $1 WHERE id=$2 AND money >= $1`, [basePrice, userId]);
+    await pool.query(`INSERT INTO user_properties (property_id, owner_id) VALUES ($1,$2)`, [propertyId, userId]);
+  }
+
+  res.json({ success: true });
 });
 
-// Root
+// Sell property
+app.post("/properties/sell", async (req, res) => {
+  const { userId, propertyId, salePrice } = req.body;
+
+  const property = await pool.query(`SELECT * FROM user_properties WHERE property_id=$1 AND owner_id=$2`, [propertyId, userId]);
+  if (property.rows.length === 0) return res.status(400).json({ error: "You don’t own this property" });
+
+  await pool.query(`UPDATE user_properties SET is_for_sale=true, sale_price=$1 WHERE property_id=$2`, [salePrice, propertyId]);
+  res.json({ success: true });
+});
+
+// Set custom price (e.g. bullets, casino spins)
+app.post("/properties/set-price", async (req, res) => {
+  const { userId, propertyId, customPrice } = req.body;
+
+  const property = await pool.query(`SELECT * FROM user_properties WHERE property_id=$1 AND owner_id=$2`, [propertyId, userId]);
+  if (property.rows.length === 0) return res.status(400).json({ error: "You don’t own this property" });
+
+  await pool.query(`UPDATE user_properties SET custom_price=$1 WHERE property_id=$2`, [customPrice, propertyId]);
+  res.json({ success: true });
+});
+
+// --- Root ---
 app.get("/", (req, res) => {
-  res.send("✅ Mafia Game API running. Try /crimes, /cars, /properties");
+  res.send("✅ Mafia Game API running. Try /crimes or /properties");
 });
 
 app.listen(4000, () => console.log("Server running on http://localhost:4000"));
+
