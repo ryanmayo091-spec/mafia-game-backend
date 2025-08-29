@@ -1,174 +1,139 @@
-import express from "express";
-import pkg from "pg";
-import bcrypt from "bcrypt";
-import bodyParser from "body-parser";
-import cors from "cors";
+import { useEffect, useState } from "react";
+import { Home, Sword, Banknote, Car, Lock, Trophy, LogOut } from "lucide-react";
 
-const { Pool } = pkg;
-const app = express();
+import Crimes from "./pages/crimes";
+import Bank from "./pages/bank";
+import Garage from "./pages/garage";
+import Prison from "./pages/prison";
+import Rankings from "./pages/rankings";
 
-app.use(cors());
-app.use(bodyParser.json());
+import StatCard from "./components/statcard";
 
-// Connect to DB
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-});
+const API_URL = "https://mafia-game-kxct.onrender.com";
 
-// === Rank System Config ===
-const RANKS = [
-  { name: "Rookie", xp: 0 },
-  { name: "Thug", xp: 100 },
-  { name: "Hustler", xp: 300 },
-  { name: "Gangster", xp: 700 },
-  { name: "Capo", xp: 1500 },
-  { name: "Underboss", xp: 3000 },
-  { name: "Boss", xp: 6000 },
-  { name: "Godfather", xp: 12000 }
-];
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [activeTab, setActiveTab] = useState("home");
 
-function getRank(xp) {
-  let current = RANKS[0].name;
-  for (let rank of RANKS) {
-    if (xp >= rank.xp) current = rank.name;
+  useEffect(() => {
+    const saved = localStorage.getItem("user");
+    if (saved) setUser(JSON.parse(saved));
+  }, []);
+
+  async function login(e) {
+    e.preventDefault();
+    const res = await fetch(`${API_URL}/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    const data = await res.json();
+    if (data.success) {
+      setUser(data.user);
+      localStorage.setItem("user", JSON.stringify(data.user));
+    } else alert(data.error);
   }
-  return current;
+
+  async function register(e) {
+    e.preventDefault();
+    const res = await fetch(`${API_URL}/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    const data = await res.json();
+    if (data.success) alert("Registered! Now log in.");
+    else alert(data.error);
+  }
+
+  function logout() {
+    setUser(null);
+    localStorage.removeItem("user");
+  }
+
+  if (!user) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gray-900 text-white">
+        <div className="bg-gray-800 p-6 rounded-xl shadow-lg w-80">
+          <h1 className="text-2xl font-bold mb-6 text-center">Mafia Game</h1>
+          <form onSubmit={login} className="flex flex-col gap-3">
+            <input className="p-2 rounded text-black" placeholder="Username" value={username} onChange={(e) => setUsername(e.target.value)} />
+            <input className="p-2 rounded text-black" type="password" placeholder="Password" value={password} onChange={(e) => setPassword(e.target.value)} />
+            <button className="bg-green-600 hover:bg-green-700 p-2 rounded font-semibold">Login</button>
+          </form>
+          <button onClick={register} className="mt-4 text-sm underline block mx-auto hover:text-green-400">Or Register</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex min-h-screen bg-gray-900 text-white">
+      {/* Sidebar */}
+      <aside className="w-64 bg-gray-800 p-6 flex flex-col shadow-lg">
+        <h2 className="text-2xl font-bold mb-8 text-green-400">Mafia Game</h2>
+        <nav className="flex flex-col gap-3">
+          <TabButton icon={<Home size={18} />} label="Home" active={activeTab === "home"} onClick={() => setActiveTab("home")} />
+          <TabButton icon={<Sword size={18} />} label="Crimes" active={activeTab === "crimes"} onClick={() => setActiveTab("crimes")} />
+          <TabButton icon={<Banknote size={18} />} label="Bank" active={activeTab === "bank"} onClick={() => setActiveTab("bank")} />
+          <TabButton icon={<Car size={18} />} label="Garage" active={activeTab === "garage"} onClick={() => setActiveTab("garage")} />
+          <TabButton icon={<Lock size={18} />} label="Prison" active={activeTab === "prison"} onClick={() => setActiveTab("prison")} />
+          <TabButton icon={<Trophy size={18} />} label="Rankings" active={activeTab === "rankings"} onClick={() => setActiveTab("rankings")} />
+        </nav>
+        <div className="mt-auto pt-6 border-t border-gray-700">
+          <div className="mb-2 text-sm opacity-80">{user.username}</div>
+          <button onClick={logout} className="flex items-center gap-2 w-full bg-red-600 hover:bg-red-700 p-2 rounded justify-center">
+            <LogOut size={16} /> Logout
+          </button>
+        </div>
+      </aside>
+
+      {/* Main content */}
+      <main className="flex-1 p-8">
+        {activeTab === "home" && (
+          <div className="space-y-8">
+            <div className="bg-gray-800 p-6 rounded-lg shadow-lg flex items-center gap-6">
+              <img src="https://i.ibb.co/7y6yC7W/mafia-avatar.png" alt="Avatar" className="w-20 h-20 rounded-full border-2 border-green-500" />
+              <div>
+                <h2 className="text-2xl font-bold">{user.username}</h2>
+                <p className="opacity-75">Rank: {user.rank || "Street Thug"}</p>
+                <div className="w-48 bg-gray-700 rounded-full h-3 mt-2">
+                  <div className="bg-green-500 h-3 rounded-full" style={{ width: `${user.xp ? (user.xp % 100) : 0}%` }} />
+                </div>
+                <p className="text-xs mt-1 opacity-70">{user.xp || 0} XP</p>
+              </div>
+            </div>
+
+            <div className="grid gap-6 sm:grid-cols-2 md:grid-cols-4">
+              <StatCard title="Money" value={`$${user.money ?? 0}`} image="https://i.ibb.co/k53Qd5k/money-bag.png" />
+              <StatCard title="Total Crimes" value={user.total_crimes ?? 0} image="https://i.ibb.co/pj3zRJL/gun.png" />
+              <StatCard title="Successful" value={user.successful_crimes ?? 0} image="https://i.ibb.co/0Y0Y3cs/mafia-hat.png" />
+              <StatCard title="Unsuccessful" value={user.unsuccessful_crimes ?? 0} image="https://i.ibb.co/SBSj3tM/prison-bars.png" />
+            </div>
+          </div>
+        )}
+
+        {activeTab === "crimes" && <Crimes user={user} API_URL={API_URL} />}
+        {activeTab === "bank" && <Bank user={user} API_URL={API_URL} />}
+        {activeTab === "garage" && <Garage user={user} API_URL={API_URL} />}
+        {activeTab === "prison" && <Prison user={user} API_URL={API_URL} />}
+        {activeTab === "rankings" && <Rankings API_URL={API_URL} />}
+      </main>
+    </div>
+  );
 }
 
-// === Init DB Tables ===
-async function initDB() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id SERIAL PRIMARY KEY,
-      username TEXT UNIQUE,
-      password TEXT,
-      money INTEGER DEFAULT 0,
-      points INTEGER DEFAULT 0,
-      total_crimes INTEGER DEFAULT 0,
-      successful_crimes INTEGER DEFAULT 0,
-      unsuccessful_crimes INTEGER DEFAULT 0,
-      last_crimes JSONB DEFAULT '{}'::jsonb,
-      xp INTEGER DEFAULT 0,
-      rank TEXT DEFAULT 'Rookie'
-    )
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS crimes (
-      id SERIAL PRIMARY KEY,
-      name TEXT,
-      description TEXT,
-      category TEXT,
-      min_reward INTEGER,
-      max_reward INTEGER,
-      success_rate REAL,
-      cooldown_seconds INTEGER
-    )
-  `);
+function TabButton({ icon, label, active, onClick }) {
+  return (
+    <button
+      onClick={onClick}
+      className={`flex items-center gap-2 px-3 py-2 rounded font-medium transition-colors ${
+        active ? "bg-gray-700 text-green-400" : "hover:bg-gray-700"
+      }`}
+    >
+      {icon} {label}
+    </button>
+  );
 }
-initDB();
-
-// === Register ===
-app.post("/register", async (req, res) => {
-  const { username, password } = req.body;
-  try {
-    const hashed = await bcrypt.hash(password, 10);
-    const result = await pool.query(
-      `INSERT INTO users (username, password) VALUES ($1, $2) RETURNING *`,
-      [username, hashed]
-    );
-    res.json({ success: true, user: result.rows[0] });
-  } catch (err) {
-    res.status(400).json({ error: "Username taken" });
-  }
-});
-
-// === Login ===
-app.post("/login", async (req, res) => {
-  const { username, password } = req.body;
-  const result = await pool.query(`SELECT * FROM users WHERE username = $1`, [username]);
-  if (result.rows.length === 0) return res.status(400).json({ error: "User not found" });
-
-  const user = result.rows[0];
-  const match = await bcrypt.compare(password, user.password);
-  if (!match) return res.status(401).json({ error: "Invalid password" });
-
-  res.json({ success: true, user });
-});
-
-// === Get Crimes ===
-app.get("/crimes", async (req, res) => {
-  const result = await pool.query(`SELECT * FROM crimes ORDER BY id ASC`);
-  res.json(result.rows);
-});
-
-// === Commit Crime ===
-app.post("/commit-crime", async (req, res) => {
-  const { userId, crimeId } = req.body;
-
-  const userResult = await pool.query(`SELECT * FROM users WHERE id = $1`, [userId]);
-  if (userResult.rows.length === 0) return res.status(404).json({ error: "User not found" });
-  const user = userResult.rows[0];
-
-  const crimeResult = await pool.query(`SELECT * FROM crimes WHERE id = $1`, [crimeId]);
-  if (crimeResult.rows.length === 0) return res.status(404).json({ error: "Crime not found" });
-  const crime = crimeResult.rows[0];
-
-  // Check cooldown
-  const lastCrimes = user.last_crimes || {};
-  const lastCrimeTime = lastCrimes[crimeId] ? new Date(lastCrimes[crimeId]).getTime() : 0;
-  const now = Date.now();
-  if (lastCrimeTime + crime.cooldown_seconds * 1000 > now) {
-    const wait = Math.ceil((lastCrimeTime + crime.cooldown_seconds * 1000 - now) / 1000);
-    return res.json({ success: false, message: `⏳ Wait ${wait}s`, cooldown: wait });
-  }
-
-  const success = Math.random() < crime.success_rate;
-  let reward = 0;
-  let xpGain = Math.floor(crime.max_reward / 10);
-
-  if (success) {
-    reward = Math.floor(Math.random() * (crime.max_reward - crime.min_reward + 1)) + crime.min_reward;
-    await pool.query(
-      `UPDATE users 
-       SET money = money + $1, xp = xp + $2, total_crimes = total_crimes + 1, successful_crimes = successful_crimes + 1,
-           last_crimes = COALESCE(last_crimes, '{}'::jsonb) || jsonb_build_object($3, NOW())
-       WHERE id = $4`,
-      [reward, xpGain, crimeId, userId]
-    );
-  } else {
-    xpGain = Math.floor(xpGain / 4);
-    await pool.query(
-      `UPDATE users 
-       SET xp = xp + $1, total_crimes = total_crimes + 1, unsuccessful_crimes = unsuccessful_crimes + 1,
-           last_crimes = COALESCE(last_crimes, '{}'::jsonb) || jsonb_build_object($2, NOW())
-       WHERE id = $3`,
-      [xpGain, crimeId, userId]
-    );
-  }
-
-  // Update rank
-  const updatedUserResult = await pool.query(`SELECT * FROM users WHERE id = $1`, [userId]);
-  const updatedUser = updatedUserResult.rows[0];
-  const newRank = getRank(updatedUser.xp);
-
-  if (newRank !== updatedUser.rank) {
-    await pool.query(`UPDATE users SET rank = $1 WHERE id = $2`, [newRank, userId]);
-    updatedUser.rank = newRank;
-  }
-
-  res.json({
-    success,
-    reward,
-    xpGain,
-    newRank: updatedUser.rank,
-    message: success ? `✅ You earned $${reward} and ${xpGain} XP` : `❌ You failed but gained ${xpGain} XP`,
-    user: updatedUser,
-  });
-});
-
-// === Root ===
-app.get("/", (req, res) => res.send("✅ Mafia Game API Running"));
-
-app.listen(4000, () => console.log("Server running on http://localhost:4000"));
