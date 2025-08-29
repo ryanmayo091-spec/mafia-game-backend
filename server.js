@@ -1,224 +1,102 @@
-// server.js
-import express from "express";
-import pkg from "pg";
-import bcrypt from "bcrypt";
-import bodyParser from "body-parser";
-import cors from "cors";
+// === Rank System Config ===
+const RANKS = [
+  { name: "Rookie", xp: 0 },
+  { name: "Thug", xp: 100 },
+  { name: "Hustler", xp: 300 },
+  { name: "Gangster", xp: 700 },
+  { name: "Capo", xp: 1500 },
+  { name: "Underboss", xp: 3000 },
+  { name: "Boss", xp: 6000 },
+  { name: "Godfather", xp: 12000 }
+];
 
-const { Pool } = pkg;
-const app = express();
-
-app.use(cors());
-app.use(bodyParser.json());
-
-// ---- DB ----
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-});
-
-async function initDB() {
-  // users
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id SERIAL PRIMARY KEY,
-      username TEXT UNIQUE,
-      password TEXT,
-      money INTEGER DEFAULT 0,
-      points INTEGER DEFAULT 0,
-      total_crimes INTEGER DEFAULT 0,
-      successful_crimes INTEGER DEFAULT 0,
-      unsuccessful_crimes INTEGER DEFAULT 0,
-      jail_until TIMESTAMP
-    );
-  `);
-  await pool.query(`
-    ALTER TABLE users
-    ADD COLUMN IF NOT EXISTS last_crimes JSONB DEFAULT '{}';
-  `);
-
-  // crimes
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS crimes (
-      id SERIAL PRIMARY KEY,
-      name TEXT,
-      min_reward INTEGER,
-      max_reward INTEGER,
-      success_rate REAL,
-      cooldown_seconds INTEGER
-    );
-  `);
-  await pool.query(`ALTER TABLE crimes ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'Petty';`);
-  await pool.query(`ALTER TABLE crimes ADD COLUMN IF NOT EXISTS description TEXT DEFAULT '';`);
-
-  // seed crimes
-  const { rows } = await pool.query(`SELECT COUNT(*) FROM crimes;`);
-  if (parseInt(rows[0].count, 10) === 0) {
-    await pool.query(`
-      INSERT INTO crimes (category, name, description, min_reward, max_reward, success_rate, cooldown_seconds)
-      VALUES
-      -- Petty
-      ('Petty', 'Pickpocket a stranger', 'Slip through the crowd and steal from someone distracted.', 5, 20, 0.8, 20),
-      ('Petty', 'Mug a businessman', 'Corner a rich-looking man in an alley. Quick cash, but risky.', 20, 100, 0.6, 60),
-
-      -- Organized
-      ('Organized', 'Rob a jewelry store', 'Smash-and-grab under pressure. Guards and alarms make it dangerous.', 100, 500, 0.4, 180),
-      ('Organized', 'Hijack a truck', 'Intercept a delivery truck for valuable goods.', 150, 700, 0.35, 240),
-
-      -- Heists
-      ('Heist', 'Bank heist', 'The ultimate score. If you succeed, you’re rich. If not, you’re in jail.', 500, 2000, 0.2, 300),
-      ('Heist', 'Casino robbery', 'Storm the casino vault. A fortune if you succeed.', 1000, 5000, 0.15, 600)
-    ;`);
+function getRank(xp) {
+  let current = RANKS[0].name;
+  for (let rank of RANKS) {
+    if (xp >= rank.xp) current = rank.name;
   }
-
-  console.log("✅ DB ready (safe migrations)");
+  return current;
 }
 
-await initDB().catch((e) => {
-  console.error("DB init failed:", e);
-  process.exit(1);
+// === Migration for XP + Rank ===
+await pool.query(`
+  ALTER TABLE users 
+  ADD COLUMN IF NOT EXISTS xp INTEGER DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS rank TEXT DEFAULT 'Rookie';
+`);
+
+// === Get Crimes (locked by rank) ===
+app.get("/crimes", async (req, res) => {
+  const result = await pool.query(`SELECT * FROM crimes ORDER BY id ASC`);
+  res.json(result.rows);
 });
 
-// ---- Auth ----
-app.post("/register", async (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ error: "Missing username or password" });
-  try {
-    const hashed = await bcrypt.hash(password, 10);
-    const result = await pool.query(
-      `INSERT INTO users (username, password) VALUES ($1, $2) RETURNING id;`,
-      [username, hashed]
-    );
-    res.json({ success: true, userId: result.rows[0].id });
-  } catch (err) {
-    res.status(400).json({ error: "Username taken" });
-  }
-});
-
-app.post("/login", async (req, res) => {
-  const { username, password } = req.body;
-  const result = await pool.query(`SELECT * FROM users WHERE username = $1;`, [username]);
-  if (result.rows.length === 0) return res.status(400).json({ error: "User not found" });
-  const user = result.rows[0];
-  const ok = await bcrypt.compare(password, user.password);
-  if (!ok) return res.status(401).json({ error: "Invalid password" });
-  res.json({ success: true, user });
-});
-
-// ---- Crimes ----
-app.get("/crimes", async (_req, res) => {
-  const result = await pool.query(`SELECT * FROM crimes ORDER BY category, id ASC;`);
-  const grouped = result.rows.reduce((acc, c) => {
-    (acc[c.category] ??= []).push(c);
-    return acc;
-  }, {});
-  res.json(grouped);
-});
-
+// === Commit Crime with XP + Rank ===
 app.post("/commit-crime", async (req, res) => {
   const { userId, crimeId } = req.body;
-  if (!userId || !crimeId) return res.status(400).json({ error: "Missing userId or crimeId" });
 
-  // user
-  const ures = await pool.query(`SELECT * FROM users WHERE id = $1;`, [userId]);
-  if (ures.rows.length === 0) return res.status(404).json({ error: "User not found" });
-  const user = ures.rows[0];
+  const userResult = await pool.query(`SELECT * FROM users WHERE id = $1`, [userId]);
+  if (userResult.rows.length === 0) return res.status(404).json({ error: "User not found" });
+  const user = userResult.rows[0];
+
+  const crimeResult = await pool.query(`SELECT * FROM crimes WHERE id = $1`, [crimeId]);
+  if (crimeResult.rows.length === 0) return res.status(404).json({ error: "Crime not found" });
+  const crime = crimeResult.rows[0];
+
+  // Check per-crime cooldown
   const lastCrimes = user.last_crimes || {};
-
-  // jail
-  if (user.jail_until && new Date(user.jail_until) > new Date()) {
-    return res.json({
-      success: false,
-      story: "🚔 You're still in jail.",
-      jail_until: user.jail_until,
-      user,
-    });
-  }
-
-  // crime
-  const cres = await pool.query(`SELECT * FROM crimes WHERE id = $1;`, [crimeId]);
-  if (cres.rows.length === 0) return res.status(404).json({ error: "Crime not found" });
-  const crime = cres.rows[0];
-
-  // cooldown
-  const lastAttempt = lastCrimes[crimeId];
+  const lastCrimeTime = lastCrimes[crimeId] ? new Date(lastCrimes[crimeId]).getTime() : 0;
   const now = Date.now();
-  if (lastAttempt && new Date(lastAttempt).getTime() + crime.cooldown_seconds * 1000 > now) {
-    const wait = Math.ceil(
-      (new Date(lastAttempt).getTime() + crime.cooldown_seconds * 1000 - now) / 1000
-    );
-    return res.json({
-      success: false,
-      story: `⏳ You must wait ${wait}s before trying '${crime.name}' again.`,
-      cooldown: wait,
-      user,
-    });
+
+  if (lastCrimeTime + crime.cooldown_seconds * 1000 > now) {
+    const wait = Math.ceil((lastCrimeTime + crime.cooldown_seconds * 1000 - now) / 1000);
+    return res.json({ success: false, message: `⏳ Wait ${wait}s before retrying this crime.`, cooldown: wait });
   }
 
-  // roll
   const success = Math.random() < crime.success_rate;
   let reward = 0;
-  let jail_until = null;
-  let pointsGained = 0;
-  let story = "";
+  let xpGain = Math.floor(crime.max_reward / 10); // XP scales with crime difficulty
 
   if (success) {
-    reward =
-      Math.floor(Math.random() * (crime.max_reward - crime.min_reward + 1)) +
-      crime.min_reward;
-    pointsGained = Math.max(1, Math.ceil((crime.max_reward / 50) * crime.success_rate * 10));
-
-    story = `✅ '${crime.name}' succeeded! You gained $${reward} & ${pointsGained} points.`;
-
+    reward = Math.floor(Math.random() * (crime.max_reward - crime.min_reward + 1)) + crime.min_reward;
     await pool.query(
-      `
-      UPDATE users
-      SET money = money + $1,
-          points = points + $2,
-          total_crimes = total_crimes + 1,
-          successful_crimes = successful_crimes + 1,
-          last_crimes = jsonb_set(COALESCE(last_crimes, '{}'), $3, to_jsonb(NOW()::text))
-      WHERE id = $4;
-      `,
-      [reward, pointsGained, `{${crimeId}}`, userId]
+      `UPDATE users 
+       SET money = money + $1, xp = xp + $2,
+           total_crimes = total_crimes + 1, successful_crimes = successful_crimes + 1,
+           last_crimes = COALESCE(last_crimes, '{}'::jsonb) || jsonb_build_object($3, NOW())
+       WHERE id = $4`,
+      [reward, xpGain, crimeId, userId]
     );
   } else {
-    jail_until = new Date(now + crime.cooldown_seconds * 1000);
-    pointsGained = 1;
-    story = `❌ '${crime.name}' failed! You got nailed. +${pointsGained} pity point. Jailed for ${crime.cooldown_seconds}s.`;
-
+    xpGain = Math.floor(xpGain / 4); // failing still gives a little XP
     await pool.query(
-      `
-      UPDATE users
-      SET points = points + $1,
-          total_crimes = total_crimes + 1,
-          unsuccessful_crimes = unsuccessful_crimes + 1,
-          jail_until = $2,
-          last_crimes = jsonb_set(COALESCE(last_crimes, '{}'), $3, to_jsonb(NOW()::text))
-      WHERE id = $4;
-      `,
-      [pointsGained, jail_until, `{${crimeId}}`, userId]
+      `UPDATE users 
+       SET xp = xp + $1,
+           total_crimes = total_crimes + 1, unsuccessful_crimes = unsuccessful_crimes + 1,
+           last_crimes = COALESCE(last_crimes, '{}'::jsonb) || jsonb_build_object($2, NOW())
+       WHERE id = $3`,
+      [xpGain, crimeId, userId]
     );
   }
 
-  const updated = await pool.query(`SELECT * FROM users WHERE id = $1;`, [userId]);
+  // Update rank
+  const updatedUserResult = await pool.query(`SELECT * FROM users WHERE id = $1`, [userId]);
+  const updatedUser = updatedUserResult.rows[0];
+  const newRank = getRank(updatedUser.xp);
+
+  if (newRank !== updatedUser.rank) {
+    await pool.query(`UPDATE users SET rank = $1 WHERE id = $2`, [newRank, userId]);
+    updatedUser.rank = newRank;
+  }
+
   res.json({
     success,
     reward,
-    pointsGained,
-    story,
-    jail_until,
-    user: updated.rows[0],
+    xpGain,
+    newRank: updatedUser.rank,
+    message: success
+      ? `✅ You earned $${reward} and ${xpGain} XP`
+      : `❌ You failed but still gained ${xpGain} XP`,
+    user: updatedUser,
   });
-});
-
-// ---- Root ----
-app.get("/", (_req, res) => {
-  res.send("✅ Mafia Game API running with safe migrations + advanced crimes");
-});
-
-// ---- Listen ----
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => {
-  console.log(`🚀 Server listening on http://localhost:${PORT}`);
 });
