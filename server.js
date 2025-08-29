@@ -25,28 +25,13 @@ async function initDB() {
     money INTEGER DEFAULT 0,
     bank_balance INTEGER DEFAULT 0,
     bullets INTEGER DEFAULT 0,
+    role TEXT DEFAULT 'player',
     total_crimes INTEGER DEFAULT 0,
     successful_crimes INTEGER DEFAULT 0,
     unsuccessful_crimes INTEGER DEFAULT 0,
     last_crime TIMESTAMP,
     jail_until TIMESTAMP,
     gang_id INTEGER
-  )`);
-
-  await pool.query(`CREATE TABLE IF NOT EXISTS gangs (
-    id SERIAL PRIMARY KEY,
-    name TEXT UNIQUE,
-    boss_id INTEGER REFERENCES users(id)
-  )`);
-
-  await pool.query(`CREATE TABLE IF NOT EXISTS gang_wars (
-    id SERIAL PRIMARY KEY,
-    gang_a INTEGER REFERENCES gangs(id),
-    gang_b INTEGER REFERENCES gangs(id),
-    winner INTEGER,
-    loser INTEGER,
-    bullets_used INTEGER,
-    war_time TIMESTAMP DEFAULT NOW()
   )`);
 
   await pool.query(`CREATE TABLE IF NOT EXISTS crimes (
@@ -69,13 +54,47 @@ async function initDB() {
     property_id INTEGER REFERENCES properties(id) ON DELETE CASCADE,
     owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
     custom_price INTEGER,
-    is_for_sale BOOLEAN DEFAULT false,
-    sale_price INTEGER,
     bullets INTEGER DEFAULT 0,
     last_production TIMESTAMP DEFAULT NOW()
   )`);
 
-  // Insert defaults
+  await pool.query(`CREATE TABLE IF NOT EXISTS cars (
+    id SERIAL PRIMARY KEY,
+    model TEXT,
+    owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    price INTEGER
+  )`);
+
+  await pool.query(`CREATE TABLE IF NOT EXISTS blackmarket_items (
+    id SERIAL PRIMARY KEY,
+    name TEXT,
+    price INTEGER,
+    seller_id INTEGER REFERENCES users(id) ON DELETE CASCADE
+  )`);
+
+  await pool.query(`CREATE TABLE IF NOT EXISTS gangs (
+    id SERIAL PRIMARY KEY,
+    name TEXT UNIQUE,
+    boss_id INTEGER REFERENCES users(id)
+  )`);
+
+  await pool.query(`CREATE TABLE IF NOT EXISTS gang_wars (
+    id SERIAL PRIMARY KEY,
+    gang_a INTEGER REFERENCES gangs(id),
+    gang_b INTEGER REFERENCES gangs(id),
+    winner INTEGER,
+    loser INTEGER,
+    bullets_used INTEGER,
+    war_time TIMESTAMP DEFAULT NOW()
+  )`);
+
+  await pool.query(`CREATE TABLE IF NOT EXISTS casino_config (
+    id INT PRIMARY KEY,
+    slot_odds REAL,
+    blackjack_odds REAL
+  )`);
+
+  // Seed defaults
   const crimesCount = await pool.query("SELECT COUNT(*) FROM crimes");
   if (parseInt(crimesCount.rows[0].count) === 0) {
     await pool.query(`
@@ -97,6 +116,11 @@ async function initDB() {
       ('Casino', 50000),
       ('Nightclub', 20000)
     `);
+  }
+
+  const casinoConf = await pool.query("SELECT COUNT(*) FROM casino_config");
+  if (parseInt(casinoConf.rows[0].count) === 0) {
+    await pool.query("INSERT INTO casino_config (id, slot_odds, blackjack_odds) VALUES (1,0.3,0.45)");
   }
 }
 initDB();
@@ -134,118 +158,148 @@ app.get("/crimes", async (_, res) => {
   res.json(result.rows);
 });
 
-// --- Bullet Factory ---
-async function updateBulletFactory(factoryId) {
-  const res = await pool.query(`SELECT * FROM user_properties WHERE id=$1`, [factoryId]);
-  if (res.rows.length === 0) return null;
-  const f = res.rows[0];
+// --- Bank ---
+app.post("/bank/deposit", async (req, res) => {
+  const { userId, amount } = req.body;
+  if (amount <= 0) return res.status(400).json({ error: "Invalid amount" });
 
-  const now = new Date();
-  const last = new Date(f.last_production || new Date());
-  const minutes = Math.floor((now - last) / (1000 * 60));
-  if (minutes > 0) {
-    const produced = minutes * 2;
-    const newStock = (f.bullets || 0) + produced;
-    await pool.query(
-      `UPDATE user_properties SET bullets=$1, last_production=NOW() WHERE id=$2`,
-      [newStock, factoryId]
-    );
-  }
+  const userRes = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
+  const user = userRes.rows[0];
+  if (!user) return res.status(404).json({ error: "User not found" });
+  if (user.money < amount) return res.status(400).json({ error: "Not enough cash" });
 
-  const updated = await pool.query(`SELECT * FROM user_properties WHERE id=$1`, [factoryId]);
-  return updated.rows[0];
-}
-
-app.post("/factory/buy", async (req, res) => {
-  const { userId, propertyId, amount } = req.body;
-  const factory = await updateBulletFactory(propertyId);
-  if (!factory || factory.bullets < amount) return res.status(400).json({ error: "Not enough stock" });
-
-  const price = (factory.custom_price || 100) * amount;
-  const buyerRes = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
-  const buyer = buyerRes.rows[0];
-  if (buyer.money < price) return res.status(400).json({ error: "Not enough money" });
-
-  await pool.query(`UPDATE users SET money=money-$1, bullets=bullets+$2 WHERE id=$3`, [price, amount, userId]);
-  await pool.query(`UPDATE users SET money=money+$1 WHERE id=$2`, [price, factory.owner_id]);
-  await pool.query(`UPDATE user_properties SET bullets=bullets-$1 WHERE id=$2`, [amount, propertyId]);
-
-  res.json({ success: true, bulletsBought: amount, cost: price });
+  await pool.query(`UPDATE users SET money=money-$1, bank_balance=bank_balance+$1 WHERE id=$2`, [amount, userId]);
+  const updated = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
+  res.json({ success: true, user: updated.rows[0], message: `Deposited $${amount}` });
 });
 
-// --- PvP Attacks ---
-app.post("/attack", async (req, res) => {
-  const { attackerId, defenderId, bulletsUsed } = req.body;
-  const attackerRes = await pool.query(`SELECT * FROM users WHERE id=$1`, [attackerId]);
-  const defenderRes = await pool.query(`SELECT * FROM users WHERE id=$1`, [defenderId]);
-  if (attackerRes.rows.length === 0 || defenderRes.rows.length === 0) return res.status(404).json({ error: "Player not found" });
+app.post("/bank/withdraw", async (req, res) => {
+  const { userId, amount } = req.body;
+  if (amount <= 0) return res.status(400).json({ error: "Invalid amount" });
 
-  const attacker = attackerRes.rows[0];
-  const defender = defenderRes.rows[0];
-  if (attacker.bullets < bulletsUsed) return res.status(400).json({ error: "Not enough bullets" });
+  const userRes = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
+  const user = userRes.rows[0];
+  if (!user) return res.status(404).json({ error: "User not found" });
+  if (user.bank_balance < amount) return res.status(400).json({ error: "Not enough bank balance" });
 
-  await pool.query(`UPDATE users SET bullets=bullets-$1 WHERE id=$2`, [bulletsUsed, attackerId]);
-
-  const chance = Math.min(0.9, bulletsUsed / 100);
-  const win = Math.random() < chance;
-
-  if (win) {
-    const stolen = Math.floor(defender.money * 0.1);
-    await pool.query(`UPDATE users SET money=money-$1 WHERE id=$2`, [stolen, defenderId]);
-    await pool.query(`UPDATE users SET money=money+$1 WHERE id=$2`, [stolen, attackerId]);
-    return res.json({ success: true, message: `Attack successful! Stole $${stolen}` });
-  } else {
-    return res.json({ success: false, message: "Attack failed! Bullets wasted." });
-  }
+  await pool.query(`UPDATE users SET money=money+$1, bank_balance=bank_balance-$1 WHERE id=$2`, [amount, userId]);
+  const updated = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
+  res.json({ success: true, user: updated.rows[0], message: `Withdrew $${amount}` });
 });
 
-// --- Gangs ---
-app.post("/gang/create", async (req, res) => {
-  const { bossId, name } = req.body;
-  try {
-    const gangRes = await pool.query(`INSERT INTO gangs (name, boss_id) VALUES ($1,$2) RETURNING id`, [name, bossId]);
-    await pool.query(`UPDATE users SET gang_id=$1 WHERE id=$2`, [gangRes.rows[0].id, bossId]);
-    res.json({ success: true, gangId: gangRes.rows[0].id });
-  } catch {
-    res.status(400).json({ error: "Gang name taken" });
-  }
+// --- Garage ---
+app.get("/garage/:userId", async (req, res) => {
+  const { userId } = req.params;
+  const cars = await pool.query(`SELECT * FROM cars WHERE owner_id=$1`, [userId]);
+  res.json(cars.rows);
 });
 
-app.post("/gang/join", async (req, res) => {
-  const { userId, gangId } = req.body;
-  await pool.query(`UPDATE users SET gang_id=$1 WHERE id=$2`, [gangId, userId]);
+app.post("/garage/buy", async (req, res) => {
+  const { userId, model } = req.body;
+  const prices = { Sedan: 1000, Sports: 5000, Armored: 20000 };
+  const price = prices[model] || 1000;
+
+  const userRes = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
+  const user = userRes.rows[0];
+  if (!user) return res.status(404).json({ error: "User not found" });
+  if (user.money < price) return res.status(400).json({ error: "Not enough money" });
+
+  await pool.query(`UPDATE users SET money=money-$1 WHERE id=$2`, [price, userId]);
+  await pool.query(`INSERT INTO cars (model, owner_id, price) VALUES ($1,$2,$3)`, [model, userId, price]);
+  res.json({ success: true, message: `Bought ${model} for $${price}` });
+});
+
+app.post("/garage/sell", async (req, res) => {
+  const { userId, carId } = req.body;
+  const carRes = await pool.query(`SELECT * FROM cars WHERE id=$1 AND owner_id=$2`, [carId, userId]);
+  if (carRes.rows.length === 0) return res.status(404).json({ error: "Car not found" });
+  const car = carRes.rows[0];
+
+  await pool.query(`DELETE FROM cars WHERE id=$1`, [carId]);
+  await pool.query(`UPDATE users SET money=money+$1 WHERE id=$2`, [Math.floor(car.price / 2), userId]);
+  res.json({ success: true, message: `Sold ${car.model} for $${Math.floor(car.price / 2)}` });
+});
+
+// --- Casino ---
+app.post("/casino/slots", async (req, res) => {
+  const { userId } = req.body;
+  const conf = await pool.query("SELECT * FROM casino_config WHERE id=1");
+  const odds = conf.rows[0]?.slot_odds || 0.3;
+
+  const userRes = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
+  const user = userRes.rows[0];
+  if (!user) return res.status(404).json({ error: "User not found" });
+  if (user.money < 100) return res.json({ success: false, message: "Need $100 to play" });
+
+  await pool.query(`UPDATE users SET money=money-100 WHERE id=$1`, [userId]);
+  if (Math.random() < odds) {
+    await pool.query(`UPDATE users SET money=money+500 WHERE id=$1`, [userId]);
+    return res.json({ success: true, message: "🎰 JACKPOT! You won $500" });
+  }
+  res.json({ success: false, message: "🎰 Lost this spin." });
+});
+
+app.post("/casino/blackjack", async (req, res) => {
+  const { userId } = req.body;
+  const conf = await pool.query("SELECT * FROM casino_config WHERE id=1");
+  const odds = conf.rows[0]?.blackjack_odds || 0.45;
+
+  const userRes = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
+  const user = userRes.rows[0];
+  if (!user) return res.status(404).json({ error: "User not found" });
+  if (user.money < 200) return res.json({ success: false, message: "Need $200 to play" });
+
+  await pool.query(`UPDATE users SET money=money-200 WHERE id=$1`, [userId]);
+  if (Math.random() < odds) {
+    await pool.query(`UPDATE users SET money=money+400 WHERE id=$1`, [userId]);
+    return res.json({ success: true, message: "🃏 You won Blackjack! $400 earned." });
+  }
+  res.json({ success: false, message: "🃏 Lost the hand." });
+});
+
+// --- Black Market ---
+app.get("/blackmarket", async (_, res) => {
+  const items = await pool.query(`SELECT * FROM blackmarket_items`);
+  res.json(items.rows);
+});
+
+app.post("/blackmarket/buy", async (req, res) => {
+  const { userId, itemId } = req.body;
+  const itemRes = await pool.query(`SELECT * FROM blackmarket_items WHERE id=$1`, [itemId]);
+  if (itemRes.rows.length === 0) return res.status(404).json({ error: "Item not found" });
+  const item = itemRes.rows[0];
+
+  const userRes = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
+  const user = userRes.rows[0];
+  if (!user) return res.status(404).json({ error: "User not found" });
+  if (user.money < item.price) return res.status(400).json({ error: "Not enough money" });
+
+  await pool.query(`UPDATE users SET money=money-$1 WHERE id=$2`, [item.price, userId]);
+  await pool.query(`UPDATE users SET money=money+$1 WHERE id=$2`, [item.price, item.seller_id]);
+  await pool.query(`DELETE FROM blackmarket_items WHERE id=$1`, [itemId]);
+  res.json({ success: true, message: `Bought ${item.name} for $${item.price}` });
+});
+
+// --- Properties ---
+app.get("/properties", async (_, res) => {
+  const result = await pool.query(`
+    SELECT p.id, p.name, up.owner_id, up.custom_price, up.bullets
+    FROM properties p
+    LEFT JOIN user_properties up ON p.id = up.property_id
+  `);
+  res.json(result.rows);
+});
+
+app.post("/properties/set-price", async (req, res) => {
+  const { userId, propertyId, customPrice } = req.body;
+  const result = await pool.query(`SELECT * FROM user_properties WHERE property_id=$1 AND owner_id=$2`, [propertyId, userId]);
+  if (result.rows.length === 0) return res.status(400).json({ error: "You don’t own this property" });
+
+  await pool.query(`UPDATE user_properties SET custom_price=$1 WHERE property_id=$2 AND owner_id=$3`, [customPrice, propertyId, userId]);
   res.json({ success: true });
 });
 
-app.post("/gang/war", async (req, res) => {
-  const { gangA, gangB, bulletsUsed, initiatorId } = req.body;
-  const attackerRes = await pool.query(`SELECT * FROM users WHERE id=$1`, [initiatorId]);
-  if (attackerRes.rows.length === 0) return res.status(404).json({ error: "User not found" });
-
-  const attacker = attackerRes.rows[0];
-  if (attacker.bullets < bulletsUsed) return res.status(400).json({ error: "Not enough bullets" });
-
-  await pool.query(`UPDATE users SET bullets=bullets-$1 WHERE id=$2`, [bulletsUsed, initiatorId]);
-
-  const chance = Math.min(0.9, bulletsUsed / 500);
-  const win = Math.random() < chance;
-
-  if (win) {
-    await pool.query(`UPDATE gangs SET boss_id=$1 WHERE id=$2`, [initiatorId, gangB]);
-    await pool.query(
-      `INSERT INTO gang_wars (gang_a, gang_b, winner, loser, bullets_used) VALUES ($1,$2,$3,$4,$5)`,
-      [gangA, gangB, gangA, gangB, bulletsUsed]
-    );
-    res.json({ success: true, message: `Gang ${gangA} defeated ${gangB}! Turf captured.` });
-  } else {
-    await pool.query(
-      `INSERT INTO gang_wars (gang_a, gang_b, winner, loser, bullets_used) VALUES ($1,$2,$3,$4,$5)`,
-      [gangA, gangB, gangB, gangA, bulletsUsed]
-    );
-    res.json({ success: false, message: "Gang war lost! Bullets wasted." });
-  }
-});
-
+// --- Gangs ---
 app.get("/gang/wars", async (_, res) => {
   const wars = await pool.query(`
     SELECT gw.id, gw.war_time, g1.name AS gang_a, g2.name AS gang_b,
@@ -257,6 +311,77 @@ app.get("/gang/wars", async (_, res) => {
     LIMIT 20
   `);
   res.json(wars.rows);
+});
+
+// --- Admin ---
+async function isAdmin(userId) {
+  const result = await pool.query(`SELECT role FROM users WHERE id=$1`, [userId]);
+  if (result.rows.length === 0) return false;
+  const role = result.rows[0].role;
+  return role === "admin" || role === "mod";
+}
+
+app.get("/admin/users/:adminId", async (req, res) => {
+  const { adminId } = req.params;
+  if (!(await isAdmin(adminId))) return res.status(403).json({ error: "Not authorized" });
+
+  const users = await pool.query(`SELECT id, username, money, bank_balance, bullets, role FROM users ORDER BY id ASC`);
+  res.json(users.rows);
+});
+
+app.post("/admin/update-user", async (req, res) => {
+  const { adminId, targetId, money, bullets, role } = req.body;
+  if (!(await isAdmin(adminId))) return res.status(403).json({ error: "Not authorized" });
+
+  await pool.query(
+    `UPDATE users SET money=$1, bullets=$2, role=$3 WHERE id=$4`,
+    [money, bullets, role, targetId]
+  );
+  res.json({ success: true, message: "User updated" });
+});
+
+app.post("/admin/delete-user", async (req, res) => {
+  const { adminId, targetId } = req.body;
+  if (!(await isAdmin(adminId))) return res.status(403).json({ error: "Not authorized" });
+
+  await pool.query(`DELETE FROM users WHERE id=$1`, [targetId]);
+  res.json({ success: true, message: "User deleted" });
+});
+
+app.post("/admin/ban-user", async (req, res) => {
+  const { adminId, targetId } = req.body;
+  if (!(await isAdmin(adminId))) return res.status(403).json({ error: "Not authorized" });
+
+  await pool.query(`UPDATE users SET role='banned' WHERE id=$1`, [targetId]);
+  res.json({ success: true, message: "User banned" });
+});
+
+app.post("/admin/update-casino", async (req, res) => {
+  const { adminId, slot_odds, blackjack_odds } = req.body;
+  if (!(await isAdmin(adminId))) return res.status(403).json({ error: "Not authorized" });
+
+  await pool.query(`INSERT INTO casino_config (id, slot_odds, blackjack_odds)
+                    VALUES (1,$1,$2)
+                    ON CONFLICT (id) DO UPDATE SET slot_odds=$1, blackjack_odds=$2`,
+    [slot_odds, blackjack_odds]);
+  res.json({ success: true, message: "Casino odds updated" });
+});
+
+app.get("/admin/stats/:adminId", async (req, res) => {
+  const { adminId } = req.params;
+  if (!(await isAdmin(adminId))) return res.status(403).json({ error: "Not authorized" });
+
+  const richest = await pool.query(`SELECT username, money FROM users ORDER BY money DESC LIMIT 1`);
+  const bullets = await pool.query(`SELECT username, bullets FROM users ORDER BY bullets DESC LIMIT 1`);
+  const gangs = await pool.query(`SELECT name FROM gangs LIMIT 5`);
+  const users = await pool.query(`SELECT COUNT(*) FROM users`);
+
+  res.json({
+    total_users: users.rows[0].count,
+    richest: richest.rows[0],
+    most_bullets: bullets.rows[0],
+    gangs: gangs.rows,
+  });
 });
 
 // Root
