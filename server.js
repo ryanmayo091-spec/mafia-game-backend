@@ -46,19 +46,116 @@ async function initDB() {
   `);
 
   // Insert starter crimes if none exist
-  const { rows } = await pool.query("SELECT COUNT(*) FROM crimes");
-  if (parseInt(rows[0].count) === 0) {
-    await pool.query(`
-      INSERT INTO crimes (name, description, min_reward, max_reward, success_rate, cooldown_seconds)
-      VALUES
-      ('Pickpocket a stranger', 'Slip through the crowd and steal from someone distracted.', 5, 20, 0.8, 20),
-      ('Mug a businessman', 'Corner a rich-looking man in an alley. Quick cash, but risky.', 20, 100, 0.6, 60),
-      ('Rob a jewelry store', 'Smash-and-grab under pressure. Guards and alarms make it dangerous.', 100, 500, 0.4, 180),
-      ('Bank heist', 'The ultimate score. If you succeed, you’re rich. If not, you’re in jail for a long time.', 500, 2000, 0.2, 300)
-    `);
-  }
+// ✅ Crimes table (with category + description)
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS crimes (
+    id SERIAL PRIMARY KEY,
+    category TEXT,
+    name TEXT,
+    description TEXT,
+    min_reward INTEGER,
+    max_reward INTEGER,
+    success_rate REAL,
+    cooldown_seconds INTEGER
+  )
+`);
+
+// ✅ Seed crimes if none exist
+const { rows } = await pool.query("SELECT COUNT(*) FROM crimes");
+if (parseInt(rows[0].count) === 0) {
+  await pool.query(`
+    INSERT INTO crimes (category, name, description, min_reward, max_reward, success_rate, cooldown_seconds)
+    VALUES
+    -- Petty crimes
+    ('Petty', 'Pickpocket a stranger', 'Slip through the crowd and steal from someone distracted.', 5, 20, 0.8, 20),
+    ('Petty', 'Mug a businessman', 'Corner a rich-looking man in an alley. Quick cash, but risky.', 20, 100, 0.6, 60),
+
+    -- Organized crimes
+    ('Organized', 'Rob a jewelry store', 'Smash-and-grab under pressure. Guards and alarms make it dangerous.', 100, 500, 0.4, 180),
+    ('Organized', 'Hijack a truck', 'Intercept a delivery truck for valuable goods.', 150, 700, 0.35, 240),
+
+    -- Heists
+    ('Heist', 'Bank heist', 'The ultimate score. If you succeed, you’re rich. If not, you’re in jail.', 500, 2000, 0.2, 300),
+    ('Heist', 'Casino robbery', 'Storm the casino vault. A fortune if you succeed.', 1000, 5000, 0.15, 600)
+  `);
 }
-initDB();
+
+// ✅ Get crimes grouped by category
+app.get("/crimes", async (req, res) => {
+  const result = await pool.query(`SELECT * FROM crimes ORDER BY category, id ASC`);
+  const grouped = result.rows.reduce((acc, crime) => {
+    if (!acc[crime.category]) acc[crime.category] = [];
+    acc[crime.category].push(crime);
+    return acc;
+  }, {});
+  res.json(grouped);
+});
+
+// ✅ Commit crime (money + points + stories)
+app.post("/commit-crime", async (req, res) => {
+  const { userId, crimeId } = req.body;
+
+  const userResult = await pool.query(`SELECT * FROM users WHERE id = $1`, [userId]);
+  if (userResult.rows.length === 0) return res.status(404).json({ error: "User not found" });
+  const user = userResult.rows[0];
+  const lastCrimes = user.last_crimes || {};
+
+  if (user.jail_until && new Date(user.jail_until) > new Date()) {
+    return res.json({ success: false, story: "🚔 You're still in jail.", jail_until: user.jail_until });
+  }
+
+  const crimeResult = await pool.query(`SELECT * FROM crimes WHERE id = $1`, [crimeId]);
+  if (crimeResult.rows.length === 0) return res.status(404).json({ error: "Crime not found" });
+  const crime = crimeResult.rows[0];
+
+  const lastAttempt = lastCrimes[crimeId];
+  if (lastAttempt && new Date(lastAttempt).getTime() + crime.cooldown_seconds * 1000 > Date.now()) {
+    const waitTime = Math.ceil((new Date(lastAttempt).getTime() + crime.cooldown_seconds * 1000 - Date.now()) / 1000);
+    return res.json({ success: false, story: `⏳ You must wait ${waitTime}s before trying '${crime.name}' again.`, cooldown: waitTime });
+  }
+
+  const success = Math.random() < crime.success_rate;
+  let reward = 0;
+  let jail_until = null;
+  let story = "";
+  let pointsGained = 0;
+
+  if (success) {
+    reward = Math.floor(Math.random() * (crime.max_reward - crime.min_reward + 1)) + crime.min_reward;
+    pointsGained = Math.ceil((crime.max_reward / 50) * crime.success_rate * 10);
+
+    story = `✅ '${crime.name}' succeeded! You gained $${reward} & ${pointsGained} points.`;
+
+    await pool.query(
+      `UPDATE users 
+       SET money = money + $1, points = points + $2, 
+           total_crimes = total_crimes + 1, successful_crimes = successful_crimes + 1,
+           last_crimes = jsonb_set(COALESCE(last_crimes, '{}'), $3, to_jsonb(NOW()::text))
+       WHERE id = $4`,
+      [reward, pointsGained, `{${crimeId}}`, userId]
+    );
+  } else {
+    jail_until = new Date(Date.now() + crime.cooldown_seconds * 1000);
+    pointsGained = 1;
+
+    story = `❌ '${crime.name}' failed! The cops caught you. You gained 1 pity point and are jailed for ${crime.cooldown_seconds}s.`;
+
+    await pool.query(
+      `UPDATE users 
+       SET points = points + $1,
+           total_crimes = total_crimes + 1, unsuccessful_crimes = unsuccessful_crimes + 1,
+           jail_until = $2,
+           last_crimes = jsonb_set(COALESCE(last_crimes, '{}'), $3, to_jsonb(NOW()::text))
+       WHERE id = $4`,
+      [pointsGained, jail_until, `{${crimeId}}`, userId]
+    );
+  }
+
+  const updatedUser = await pool.query(`SELECT * FROM users WHERE id = $1`, [userId]);
+
+  res.json({ success, reward, pointsGained, story, jail_until, user: updatedUser.rows[0] });
+});
+
 
 // ✅ Register
 app.post("/register", async (req, res) => {
@@ -178,3 +275,4 @@ app.get("/", (req, res) => {
 });
 
 app.listen(4000, () => console.log("🚀 Server running on http://localhost:4000"));
+
