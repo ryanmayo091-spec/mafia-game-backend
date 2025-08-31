@@ -41,13 +41,19 @@ async function initDB() {
     max_reward INTEGER,
     success_rate REAL,
     cooldown_seconds INTEGER,
-    xp_reward INTEGER
+    xp_reward INTEGER DEFAULT 0
   )`);
 
   await pool.query(`CREATE TABLE IF NOT EXISTS cars (
     id SERIAL PRIMARY KEY,
     name TEXT,
     price INTEGER
+  )`);
+
+  await pool.query(`CREATE TABLE IF NOT EXISTS ranks (
+    id SERIAL PRIMARY KEY,
+    name TEXT,
+    xp_required INTEGER
   )`);
 
   // Seed crimes if empty
@@ -75,8 +81,39 @@ async function initDB() {
       ('Luxury Limo', 20000)`
     );
   }
+
+  // Seed ranks if empty
+  const rankCount = await pool.query("SELECT COUNT(*) FROM ranks");
+  if (parseInt(rankCount.rows[0].count) === 0) {
+    await pool.query(
+      `INSERT INTO ranks (name, xp_required) VALUES
+      ('Street Thug', 0),
+      ('Gangster', 100),
+      ('Capo', 500),
+      ('Boss', 2000),
+      ('Don', 5000),
+      ('Godfather', 10000)`
+    );
+  }
 }
 initDB();
+
+// === Helper: Update User Rank Based on XP ===
+async function updateUserRank(userId) {
+  const userRes = await pool.query("SELECT xp FROM users WHERE id=$1", [userId]);
+  if (userRes.rows.length === 0) return;
+
+  const xp = userRes.rows[0].xp;
+  const rankRes = await pool.query(
+    "SELECT name FROM ranks WHERE xp_required <= $1 ORDER BY xp_required DESC LIMIT 1",
+    [xp]
+  );
+
+  if (rankRes.rows.length > 0) {
+    const newRank = rankRes.rows[0].name;
+    await pool.query("UPDATE users SET rank=$1 WHERE id=$2", [newRank, userId]);
+  }
+}
 
 // === Routes ===
 
@@ -158,6 +195,9 @@ app.post("/commit-crime", async (req, res) => {
     );
   }
 
+  // Update rank based on XP
+  await updateUserRank(userId);
+
   const updatedUser = await pool.query("SELECT * FROM users WHERE id=$1", [userId]);
 
   res.json({
@@ -190,7 +230,7 @@ app.get("/garage/:userId", async (req, res) => {
 
 // Rankings
 app.get("/rankings", async (req, res) => {
-  const top = await pool.query("SELECT username, xp, money FROM users ORDER BY xp DESC, money DESC LIMIT 20");
+  const top = await pool.query("SELECT username, xp, money, rank FROM users ORDER BY xp DESC, money DESC LIMIT 20");
   res.json(top.rows);
 });
 
