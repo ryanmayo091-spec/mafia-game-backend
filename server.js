@@ -21,6 +21,7 @@ async function initDB() {
     id SERIAL PRIMARY KEY,
     username TEXT UNIQUE,
     password TEXT,
+    role TEXT DEFAULT 'player',
     pocket_money INTEGER DEFAULT 0,
     bank_money INTEGER DEFAULT 0,
     dirty_money INTEGER DEFAULT 0,
@@ -68,7 +69,7 @@ async function initDB() {
     collected BOOLEAN DEFAULT false
   )`);
 
-  // seed ranks if empty
+  // Seed ranks if empty
   const rankCount = await pool.query("SELECT COUNT(*) FROM ranks");
   if (parseInt(rankCount.rows[0].count) === 0) {
     await pool.query(
@@ -154,8 +155,6 @@ app.post("/commit-crime", async (req, res) => {
 
   if (success) {
     reward = Math.floor(Math.random() * (crime.max_reward - crime.min_reward + 1)) + crime.min_reward;
-
-    // half clean, half dirty
     const clean = Math.floor(reward * 0.5);
     const dirty = reward - clean;
 
@@ -212,44 +211,6 @@ app.post("/bank/launder", async (req, res) => {
   res.json({ success: true, message: `Laundered $${amount} dirty money (10% fee)` });
 });
 
-app.post("/bank/invest", async (req, res) => {
-  const { userId, type, amount } = req.body;
-  let returnPercent = 0.05, risk = 0.0, hours = 24;
-
-  if (type === "bonds") { returnPercent = 0.05; risk = 0; hours = 24; }
-  if (type === "business") { returnPercent = 0.25; risk = 0.3; hours = 72; }
-  if (type === "loan-shark") { returnPercent = 1.0; risk = 0.5; hours = 168; }
-
-  const completeAt = new Date(Date.now() + hours * 3600 * 1000);
-  await pool.query(
-    `INSERT INTO investments (user_id, type, amount, return_percent, risk, complete_at)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [userId, type, amount, returnPercent, risk, completeAt]
-  );
-  await pool.query("UPDATE users SET bank_money=bank_money-$1 WHERE id=$2 AND bank_money >= $1", [amount, userId]);
-
-  res.json({ success: true, message: `Invested $${amount} into ${type}` });
-});
-
-app.post("/bank/collect-investment", async (req, res) => {
-  const { investmentId } = req.body;
-  const invRes = await pool.query("SELECT * FROM investments WHERE id=$1", [investmentId]);
-  if (invRes.rows.length === 0) return res.json({ success: false, error: "Not found" });
-
-  const inv = invRes.rows[0];
-  if (new Date(inv.complete_at) > new Date()) return res.json({ success: false, error: "Not ready yet" });
-  if (inv.collected) return res.json({ success: false, error: "Already collected" });
-
-  const success = Math.random() > inv.risk;
-  let payout = 0;
-  if (success) payout = Math.floor(inv.amount * (1 + inv.return_percent));
-
-  await pool.query("UPDATE investments SET collected=true WHERE id=$1", [investmentId]);
-  if (payout > 0) await pool.query("UPDATE users SET bank_money=bank_money+$1 WHERE id=$2", [payout, inv.user_id]);
-
-  res.json({ success, payout, message: success ? `You earned $${payout}` : "Investment failed!" });
-});
-
 // === Garage ===
 app.get("/garage/:userId", async (req, res) => {
   const cars = await pool.query("SELECT * FROM cars");
@@ -258,14 +219,9 @@ app.get("/garage/:userId", async (req, res) => {
 
 // === Rankings ===
 app.get("/rankings", async (req, res) => {
-  const top = await pool.query("SELECT username, xp, money, rank FROM users ORDER BY xp DESC, bank_money DESC LIMIT 20");
+  const top = await pool.query("SELECT username, xp, pocket_money, bank_money, rank FROM users ORDER BY xp DESC, bank_money DESC LIMIT 20");
   res.json(top.rows);
 });
-
-// === Root ===
-app.get("/", (req, res) => res.send("✅ Mafia API Running with Bank 2.0"));
-
-app.listen(4000, () => console.log("🚀 Server running on http://localhost:4000"));
 
 // === Admin Middleware ===
 async function requireRole(req, res, next, allowedRoles) {
@@ -277,7 +233,7 @@ async function requireRole(req, res, next, allowedRoles) {
   next();
 }
 
-// === Admin: Manage Users ===
+// === Admin Routes ===
 app.post("/admin/give-money", async (req, res, next) => {
   await requireRole(req, res, next, ["admin"]);
 }, async (req, res) => {
@@ -303,7 +259,6 @@ app.post("/admin/release-user", async (req, res, next) => {
   res.json({ success: true, message: `User ${targetId} released from jail` });
 });
 
-// === Admin: Manage Crimes ===
 app.post("/admin/edit-crime", async (req, res, next) => {
   await requireRole(req, res, next, ["admin"]);
 }, async (req, res) => {
@@ -315,11 +270,45 @@ app.post("/admin/edit-crime", async (req, res, next) => {
   res.json({ success: true, message: `Crime ${crimeId} updated` });
 });
 
-// === Admin: Economy Settings ===
 app.post("/admin/set-tax", async (req, res, next) => {
   await requireRole(req, res, next, ["admin"]);
 }, async (req, res) => {
   const { taxRate } = req.body;
-  // Store in config table if we add one later
   res.json({ success: true, message: `Global tax rate set to ${taxRate}%` });
 });
+
+// === NEW Admin Endpoints for UI ===
+app.get("/admin/users", async (req, res) => {
+  const { query } = req.query;
+  let sql = `SELECT id, username, role, pocket_money, bank_money, dirty_money, xp, rank, jail_until
+             FROM users`;
+  const params = [];
+  if (query) {
+    sql += ` WHERE CAST(id AS TEXT) ILIKE $1 OR username ILIKE $1 OR role ILIKE $1`;
+    params.push(`%${query}%`);
+  }
+  sql += ` ORDER BY id ASC LIMIT 200`;
+  const r = await pool.query(sql, params);
+  res.json(r.rows);
+});
+
+app.get("/admin/crimes", async (req, res) => {
+  const r = await pool.query(`SELECT id, name, category, min_reward, max_reward, success_rate, cooldown_seconds FROM crimes ORDER BY category, id`);
+  res.json(r.rows);
+});
+
+app.post("/admin/set-role", async (req, res, next) => {
+  await requireRole(req, res, next, ["admin"]);
+}, async (req, res) => {
+  const { targetId, role } = req.body;
+  if (!["player", "mod", "admin"].includes(role)) {
+    return res.status(400).json({ success: false, error: "Invalid role" });
+  }
+  await pool.query("UPDATE users SET role=$1 WHERE id=$2", [role, targetId]);
+  res.json({ success: true, message: `User ${targetId} is now ${role}` });
+});
+
+// === Root ===
+app.get("/", (req, res) => res.send("✅ Mafia API Running with Crimes + Bank 2.0 + Admin Panel"));
+
+app.listen(4000, () => console.log("🚀 Server running on http://localhost:4000"));
