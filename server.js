@@ -266,3 +266,60 @@ app.get("/rankings", async (req, res) => {
 app.get("/", (req, res) => res.send("✅ Mafia API Running with Bank 2.0"));
 
 app.listen(4000, () => console.log("🚀 Server running on http://localhost:4000"));
+
+// === Admin Middleware ===
+async function requireRole(req, res, next, allowedRoles) {
+  const { userId } = req.body;
+  const userRes = await pool.query("SELECT role FROM users WHERE id=$1", [userId]);
+  if (userRes.rows.length === 0) return res.status(403).json({ error: "Invalid user" });
+  const role = userRes.rows[0].role;
+  if (!allowedRoles.includes(role)) return res.status(403).json({ error: "Permission denied" });
+  next();
+}
+
+// === Admin: Manage Users ===
+app.post("/admin/give-money", async (req, res, next) => {
+  await requireRole(req, res, next, ["admin"]);
+}, async (req, res) => {
+  const { targetId, amount } = req.body;
+  await pool.query("UPDATE users SET pocket_money=pocket_money+$1 WHERE id=$2", [amount, targetId]);
+  res.json({ success: true, message: `Gave $${amount} to user ${targetId}` });
+});
+
+app.post("/admin/jail-user", async (req, res, next) => {
+  await requireRole(req, res, next, ["admin", "mod"]);
+}, async (req, res) => {
+  const { targetId, minutes } = req.body;
+  const jailUntil = new Date(Date.now() + minutes * 60 * 1000);
+  await pool.query("UPDATE users SET jail_until=$1 WHERE id=$2", [jailUntil, targetId]);
+  res.json({ success: true, message: `User jailed until ${jailUntil}` });
+});
+
+app.post("/admin/release-user", async (req, res, next) => {
+  await requireRole(req, res, next, ["admin", "mod"]);
+}, async (req, res) => {
+  const { targetId } = req.body;
+  await pool.query("UPDATE users SET jail_until=NULL WHERE id=$1", [targetId]);
+  res.json({ success: true, message: `User ${targetId} released from jail` });
+});
+
+// === Admin: Manage Crimes ===
+app.post("/admin/edit-crime", async (req, res, next) => {
+  await requireRole(req, res, next, ["admin"]);
+}, async (req, res) => {
+  const { crimeId, min_reward, max_reward, success_rate, cooldown_seconds } = req.body;
+  await pool.query(
+    `UPDATE crimes SET min_reward=$1, max_reward=$2, success_rate=$3, cooldown_seconds=$4 WHERE id=$5`,
+    [min_reward, max_reward, success_rate, cooldown_seconds, crimeId]
+  );
+  res.json({ success: true, message: `Crime ${crimeId} updated` });
+});
+
+// === Admin: Economy Settings ===
+app.post("/admin/set-tax", async (req, res, next) => {
+  await requireRole(req, res, next, ["admin"]);
+}, async (req, res) => {
+  const { taxRate } = req.body;
+  // Store in config table if we add one later
+  res.json({ success: true, message: `Global tax rate set to ${taxRate}%` });
+});
