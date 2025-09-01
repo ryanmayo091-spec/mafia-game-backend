@@ -10,7 +10,7 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// Connect to Postgres
+// === DATABASE CONNECTION ===
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
@@ -63,7 +63,7 @@ async function initDB() {
     xp_required INTEGER
   )`);
 
-  // Seed ranks if empty
+  // Seed ranks
   const rankCount = await pool.query("SELECT COUNT(*) FROM ranks");
   if (parseInt(rankCount.rows[0].count) === 0) {
     await pool.query(`
@@ -77,7 +77,7 @@ async function initDB() {
     `);
   }
 
-  // Seed starter crimes
+  // Seed crimes
   const crimeCount = await pool.query("SELECT COUNT(*) FROM crimes");
   if (parseInt(crimeCount.rows[0].count) === 0) {
     await pool.query(`
@@ -110,28 +110,105 @@ app.post("/register", async (req, res) => {
   try {
     const hashed = await bcrypt.hash(password, 10);
     const result = await pool.query(
-      `INSERT INTO users (username, password) VALUES ($1, $2) RETURNING id`,
+      `INSERT INTO users (username, password) VALUES ($1, $2) RETURNING *`,
       [username, hashed]
     );
-    res.json({ success: true, userId: result.rows[0].id });
-  } catch (err) {
+    res.json({ success: true, user: result.rows[0] });
+  } catch {
     res.status(400).json({ error: "Username taken" });
   }
 });
 
 app.post("/login", async (req, res) => {
   const { username, password } = req.body;
-  const result = await pool.query(`SELECT * FROM users WHERE username = $1`, [
-    username,
-  ]);
-  if (result.rows.length === 0)
-    return res.status(400).json({ error: "User not found" });
+  const result = await pool.query(`SELECT * FROM users WHERE username=$1`, [username]);
+  if (result.rows.length === 0) return res.status(400).json({ error: "User not found" });
 
   const user = result.rows[0];
   const match = await bcrypt.compare(password, user.password);
   if (!match) return res.status(401).json({ error: "Invalid password" });
 
   res.json({ success: true, user });
+});
+
+// === CRIMES ===
+app.get("/crimes", async (req, res) => {
+  const crimes = await pool.query(`SELECT * FROM crimes`);
+  res.json(crimes.rows);
+});
+
+app.post("/commit-crime", async (req, res) => {
+  const { userId, crimeId } = req.body;
+  const userRes = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
+  if (userRes.rows.length === 0) return res.status(404).json({ error: "User not found" });
+  const user = userRes.rows[0];
+
+  const crimeRes = await pool.query(`SELECT * FROM crimes WHERE id=$1`, [crimeId]);
+  if (crimeRes.rows.length === 0) return res.status(404).json({ error: "Crime not found" });
+  const crime = crimeRes.rows[0];
+
+  // Cooldown check
+  const lastCrimes = user.last_crimes || {};
+  const last = lastCrimes[crimeId];
+  if (last && new Date(last).getTime() + crime.cooldown_seconds * 1000 > Date.now()) {
+    const wait = Math.ceil((new Date(last).getTime() + crime.cooldown_seconds * 1000 - Date.now()) / 1000);
+    return res.json({ success: false, message: `Cooldown: wait ${wait}s` });
+  }
+
+  // Jail check
+  if (user.jail_until && new Date(user.jail_until) > new Date()) {
+    return res.json({ success: false, message: "You are in jail!", jail_until: user.jail_until });
+  }
+
+  // Success/fail roll
+  const success = Math.random() < crime.success_rate;
+  let reward = 0;
+  let xpGain = crime.xp_reward;
+  let jail_until = null;
+
+  if (success) {
+    reward = Math.floor(Math.random() * (crime.max_reward - crime.min_reward + 1)) + crime.min_reward;
+    await pool.query(
+      `UPDATE users SET money=money+$1, xp=xp+$2, total_crimes=total_crimes+1, successful_crimes=successful_crimes+1, last_crimes=jsonb_set(coalesce(last_crimes,'{}'::jsonb), $3, to_jsonb(NOW())) WHERE id=$4`,
+      [reward, xpGain, `{${crimeId}}`, userId]
+    );
+  } else {
+    jail_until = new Date(Date.now() + crime.cooldown_seconds * 1000);
+    await pool.query(
+      `UPDATE users SET total_crimes=total_crimes+1, unsuccessful_crimes=unsuccessful_crimes+1, jail_until=$1, last_crimes=jsonb_set(coalesce(last_crimes,'{}'::jsonb), $2, to_jsonb(NOW())) WHERE id=$3`,
+      [jail_until, `{${crimeId}}`, userId]
+    );
+  }
+
+  const updated = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
+  res.json({ success, reward, jail_until, user: updated.rows[0] });
+});
+
+// === BANK ===
+app.post("/bank/deposit", async (req, res) => {
+  const { userId, amount } = req.body;
+  await pool.query(
+    `UPDATE users SET money=money-$1, bank_balance=bank_balance+$1 WHERE id=$2 AND money>=$1`,
+    [amount, userId]
+  );
+  const updated = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
+  res.json({ success: true, user: updated.rows[0], message: "Deposit successful" });
+});
+
+app.post("/bank/withdraw", async (req, res) => {
+  const { userId, amount } = req.body;
+  await pool.query(
+    `UPDATE users SET money=money+$1, bank_balance=bank_balance-$1 WHERE id=$2 AND bank_balance>=$1`,
+    [amount, userId]
+  );
+  const updated = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
+  res.json({ success: true, user: updated.rows[0], message: "Withdraw successful" });
+});
+
+// === PROPERTIES ===
+app.get("/properties", async (req, res) => {
+  const props = await pool.query(`SELECT * FROM properties`);
+  res.json(props.rows);
 });
 
 // === ADMIN ROUTES ===
@@ -148,44 +225,37 @@ app.post("/admin/update-user", async (req, res) => {
     `UPDATE users SET money=$1, bank_balance=$2, xp=$3, rank=$4, role=$5 WHERE id=$6`,
     [money, bank_balance, xp, rank, role, userId]
   );
-  res.json({ success: true, message: "User updated" });
+  const updated = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
+  res.json({ success: true, user: updated.rows[0] });
 });
 
 app.post("/admin/jail-user", async (req, res) => {
   const { userId, jailSeconds } = req.body;
   const until = jailSeconds ? new Date(Date.now() + jailSeconds * 1000) : null;
-  await pool.query(`UPDATE users SET jail_until=$1 WHERE id=$2`, [
-    until,
-    userId,
-  ]);
-  res.json({ success: true, message: "User jail updated" });
+  await pool.query(`UPDATE users SET jail_until=$1 WHERE id=$2`, [until, userId]);
+  const updated = await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]);
+  res.json({ success: true, user: updated.rows[0] });
 });
 
 app.post("/admin/set-property-owner", async (req, res) => {
   const { propertyId, ownerId } = req.body;
-  await pool.query(`UPDATE properties SET owner_id=$1 WHERE id=$2`, [
-    ownerId,
-    propertyId,
-  ]);
+  await pool.query(`UPDATE properties SET owner_id=$1 WHERE id=$2`, [ownerId, propertyId]);
   res.json({ success: true, message: "Property ownership updated" });
 });
 
 app.post("/admin/update-crime", async (req, res) => {
-  const { crimeId, min_reward, max_reward, success_rate, cooldown_seconds } =
-    req.body;
+  const { crimeId, min_reward, max_reward, success_rate, cooldown_seconds } = req.body;
   await pool.query(
     `UPDATE crimes SET min_reward=$1, max_reward=$2, success_rate=$3, cooldown_seconds=$4 WHERE id=$5`,
     [min_reward, max_reward, success_rate, cooldown_seconds, crimeId]
   );
-  res.json({ success: true, message: "Crime updated" });
+  const updated = await pool.query(`SELECT * FROM crimes WHERE id=$1`, [crimeId]);
+  res.json({ success: true, crime: updated.rows[0] });
 });
 
-// === TEST ROOT ===
+// === ROOT ===
 app.get("/", (req, res) => {
-  res.send("✅ Mafia Game API running with Admin routes");
+  res.send("✅ Mafia Game API running");
 });
 
-app.listen(4000, () =>
-  console.log("Server running on http://localhost:4000")
-);
-
+app.listen(4000, () => console.log("Server running on http://localhost:4000"));
