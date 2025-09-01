@@ -16,27 +16,24 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// === Initialize DB ===
+// === INIT DATABASE ===
 async function initDB() {
-  // Users
   await pool.query(`CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     username TEXT UNIQUE,
     password TEXT,
     money INTEGER DEFAULT 0,
     bank_balance INTEGER DEFAULT 0,
-    points INTEGER DEFAULT 0,
-    total_crimes INTEGER DEFAULT 0,
-    successful_crimes INTEGER DEFAULT 0,
-    unsuccessful_crimes INTEGER DEFAULT 0,
     xp INTEGER DEFAULT 0,
     rank TEXT DEFAULT 'Rookie',
     role TEXT DEFAULT 'player',
+    total_crimes INTEGER DEFAULT 0,
+    successful_crimes INTEGER DEFAULT 0,
+    unsuccessful_crimes INTEGER DEFAULT 0,
     jail_until TIMESTAMP,
     last_crimes JSONB DEFAULT '{}'::jsonb
   )`);
 
-  // Crimes
   await pool.query(`CREATE TABLE IF NOT EXISTS crimes (
     id SERIAL PRIMARY KEY,
     name TEXT,
@@ -49,56 +46,65 @@ async function initDB() {
     xp_reward INTEGER DEFAULT 5
   )`);
 
-  // Cooldowns
-  await pool.query(`CREATE TABLE IF NOT EXISTS user_crime_cooldowns (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    crime_id INTEGER REFERENCES crimes(id) ON DELETE CASCADE,
-    last_attempt TIMESTAMP
-  )`);
-
-  // Cars
-  await pool.query(`CREATE TABLE IF NOT EXISTS user_cars (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    car_name TEXT,
-    value INTEGER
-  )`);
-
-  // Properties
   await pool.query(`CREATE TABLE IF NOT EXISTS properties (
     id SERIAL PRIMARY KEY,
     name TEXT,
     description TEXT,
     base_price INTEGER,
+    owner_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
     income_rate INTEGER,
     production_type TEXT,
     production_rate INTEGER
   )`);
 
-  await pool.query(`CREATE TABLE IF NOT EXISTS user_properties (
+  await pool.query(`CREATE TABLE IF NOT EXISTS ranks (
     id SERIAL PRIMARY KEY,
-    property_id INTEGER REFERENCES properties(id) ON DELETE CASCADE,
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    custom_price INTEGER,
-    last_collected TIMESTAMP
+    name TEXT UNIQUE,
+    xp_required INTEGER
   )`);
 
-  // ✅ Seed properties
-  const { rows } = await pool.query("SELECT COUNT(*) FROM properties");
-  if (parseInt(rows[0].count) === 0) {
-    await pool.query(
-      `INSERT INTO properties (name, description, base_price, income_rate, production_type, production_rate)
-       VALUES 
-       ('Bullet Factory', 'Produces bullets over time for resale.', 50000, 1000, 'bullets', 50),
-       ('Casino', 'Players gamble here. Owner earns profits from house edge.', 100000, 2000, 'cash', 0),
-       ('Nightclub', 'Generates steady passive income.', 75000, 1500, 'cash', 0)`
-    );
+  // Seed ranks if empty
+  const rankCount = await pool.query("SELECT COUNT(*) FROM ranks");
+  if (parseInt(rankCount.rows[0].count) === 0) {
+    await pool.query(`
+      INSERT INTO ranks (name, xp_required) VALUES
+      ('Rookie', 0),
+      ('Thug', 100),
+      ('Enforcer', 300),
+      ('Capo', 600),
+      ('Underboss', 1000),
+      ('Boss', 2000)
+    `);
+  }
+
+  // Seed starter crimes
+  const crimeCount = await pool.query("SELECT COUNT(*) FROM crimes");
+  if (parseInt(crimeCount.rows[0].count) === 0) {
+    await pool.query(`
+      INSERT INTO crimes (name, description, category, min_reward, max_reward, success_rate, cooldown_seconds, xp_reward)
+      VALUES
+      ('Beg on the streets','Spare change from strangers.','Easy',1,10,0.9,10,5),
+      ('Pickpocket a stranger','Lift a wallet without being caught.','Easy',5,50,0.6,20,10),
+      ('Rob a store','Quick cash grab.','Medium',50,200,0.5,60,25),
+      ('Bank Heist','High stakes big win.','Hard',500,2000,0.3,300,100)
+    `);
+  }
+
+  // Seed properties
+  const propCount = await pool.query("SELECT COUNT(*) FROM properties");
+  if (parseInt(propCount.rows[0].count) === 0) {
+    await pool.query(`
+      INSERT INTO properties (name, description, base_price, income_rate, production_type, production_rate)
+      VALUES
+      ('Bullet Factory','Produces bullets every 10 minutes.',50000,0,'bullets',100),
+      ('Casino','Players gamble here. The house always wins.',200000,500,'cash',0),
+      ('Nightclub','Generates steady cash from shady business.',100000,250,'cash',0)
+    `);
   }
 }
 initDB();
 
-// === Auth ===
+// === AUTH ===
 app.post("/register", async (req, res) => {
   const { username, password } = req.body;
   try {
@@ -128,83 +134,58 @@ app.post("/login", async (req, res) => {
   res.json({ success: true, user });
 });
 
-// === Crimes ===
-app.get("/crimes", async (req, res) => {
-  const result = await pool.query(`SELECT * FROM crimes`);
-  res.json(result.rows);
-});
-
-// === Properties ===
-app.get("/properties", async (req, res) => {
-  const result = await pool.query(`SELECT * FROM properties`);
-  res.json(result.rows);
-});
-
-app.post("/properties/buy", async (req, res) => {
-  const { userId, propertyId } = req.body;
-
-  const property = (
-    await pool.query(`SELECT * FROM properties WHERE id=$1`, [propertyId])
-  ).rows[0];
-  if (!property) return res.status(404).json({ error: "Property not found" });
-
-  const user = (await pool.query(`SELECT * FROM users WHERE id=$1`, [userId]))
-    .rows[0];
-  if (!user) return res.status(404).json({ error: "User not found" });
-
-  if (user.money < property.base_price)
-    return res.json({ success: false, message: "Not enough money" });
-
-  await pool.query(
-    `UPDATE users SET money = money - $1 WHERE id=$2`,
-    [property.base_price, userId]
+// === ADMIN ROUTES ===
+app.get("/admin/get-users", async (req, res) => {
+  const users = await pool.query(
+    `SELECT id, username, money, bank_balance, xp, rank, role FROM users`
   );
-  await pool.query(
-    `INSERT INTO user_properties (property_id, user_id, last_collected) VALUES ($1,$2,NOW())`,
-    [propertyId, userId]
-  );
-
-  res.json({ success: true, message: `You bought ${property.name}` });
+  res.json(users.rows);
 });
 
-app.post("/properties/collect", async (req, res) => {
-  const { userId, propertyId } = req.body;
+app.post("/admin/update-user", async (req, res) => {
+  const { userId, money, bank_balance, xp, rank, role } = req.body;
+  await pool.query(
+    `UPDATE users SET money=$1, bank_balance=$2, xp=$3, rank=$4, role=$5 WHERE id=$6`,
+    [money, bank_balance, xp, rank, role, userId]
+  );
+  res.json({ success: true, message: "User updated" });
+});
 
-  const ownership = (
-    await pool.query(
-      `SELECT * FROM user_properties WHERE user_id=$1 AND property_id=$2`,
-      [userId, propertyId]
-    )
-  ).rows[0];
-  if (!ownership)
-    return res.status(403).json({ error: "You do not own this property" });
-
-  const property = (
-    await pool.query(`SELECT * FROM properties WHERE id=$1`, [propertyId])
-  ).rows[0];
-
-  let reward = property.income_rate;
-  if (property.production_type === "bullets") {
-    reward = property.production_rate;
-  }
-
-  await pool.query(`UPDATE users SET money = money + $1 WHERE id=$2`, [
-    reward,
+app.post("/admin/jail-user", async (req, res) => {
+  const { userId, jailSeconds } = req.body;
+  const until = jailSeconds ? new Date(Date.now() + jailSeconds * 1000) : null;
+  await pool.query(`UPDATE users SET jail_until=$1 WHERE id=$2`, [
+    until,
     userId,
   ]);
-  await pool.query(
-    `UPDATE user_properties SET last_collected=NOW() WHERE id=$1`,
-    [ownership.id]
-  );
-
-  res.json({ success: true, reward, type: property.production_type });
+  res.json({ success: true, message: "User jail updated" });
 });
 
-// === Homepage route ===
+app.post("/admin/set-property-owner", async (req, res) => {
+  const { propertyId, ownerId } = req.body;
+  await pool.query(`UPDATE properties SET owner_id=$1 WHERE id=$2`, [
+    ownerId,
+    propertyId,
+  ]);
+  res.json({ success: true, message: "Property ownership updated" });
+});
+
+app.post("/admin/update-crime", async (req, res) => {
+  const { crimeId, min_reward, max_reward, success_rate, cooldown_seconds } =
+    req.body;
+  await pool.query(
+    `UPDATE crimes SET min_reward=$1, max_reward=$2, success_rate=$3, cooldown_seconds=$4 WHERE id=$5`,
+    [min_reward, max_reward, success_rate, cooldown_seconds, crimeId]
+  );
+  res.json({ success: true, message: "Crime updated" });
+});
+
+// === TEST ROOT ===
 app.get("/", (req, res) => {
-  res.send("✅ Mafia Game API running with Properties seeded!");
+  res.send("✅ Mafia Game API running with Admin routes");
 });
 
 app.listen(4000, () =>
   console.log("Server running on http://localhost:4000")
 );
+
