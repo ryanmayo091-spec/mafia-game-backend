@@ -10,28 +10,29 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
+// Connect to Postgres using environment variable from Render
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
-// === Init DB ===
+// === INIT DATABASE ===
 async function initDB() {
   await pool.query(`CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     username TEXT UNIQUE,
     password TEXT,
-    role TEXT DEFAULT 'player',
-    pocket_money INTEGER DEFAULT 0,
-    bank_money INTEGER DEFAULT 0,
-    dirty_money INTEGER DEFAULT 0,
-    xp INTEGER DEFAULT 0,
-    rank TEXT DEFAULT 'Street Thug',
+    money INTEGER DEFAULT 0,
+    bank INTEGER DEFAULT 0,
+    points INTEGER DEFAULT 0,
     total_crimes INTEGER DEFAULT 0,
     successful_crimes INTEGER DEFAULT 0,
     unsuccessful_crimes INTEGER DEFAULT 0,
+    xp INTEGER DEFAULT 0,
+    rank TEXT DEFAULT 'Rookie',
+    role TEXT DEFAULT 'player',
     jail_until TIMESTAMP,
-    last_crimes JSONB DEFAULT '{}'
+    last_crimes JSONB DEFAULT '{}'::jsonb
   )`);
 
   await pool.query(`CREATE TABLE IF NOT EXISTS crimes (
@@ -43,272 +44,230 @@ async function initDB() {
     max_reward INTEGER,
     success_rate REAL,
     cooldown_seconds INTEGER,
-    xp_reward INTEGER DEFAULT 0
+    xp_reward INTEGER DEFAULT 5
   )`);
 
-  await pool.query(`CREATE TABLE IF NOT EXISTS cars (
+  await pool.query(`CREATE TABLE IF NOT EXISTS user_crime_cooldowns (
     id SERIAL PRIMARY KEY,
-    name TEXT,
-    price INTEGER
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    crime_id INTEGER REFERENCES crimes(id) ON DELETE CASCADE,
+    last_attempt TIMESTAMP
   )`);
 
+  await pool.query(`CREATE TABLE IF NOT EXISTS user_cars (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    car_name TEXT,
+    car_value INTEGER
+  )`);
+
+  // Insert a starter crime if none exist
+  const { rows } = await pool.query("SELECT COUNT(*) FROM crimes");
+  if (parseInt(rows[0].count) === 0) {
+    await pool.query(
+      `INSERT INTO crimes (name, description, category, min_reward, max_reward, success_rate, cooldown_seconds, xp_reward)
+       VALUES 
+       ('Beg on the streets','Spare change from strangers.','Easy',1,10,0.9,10,5),
+       ('Pickpocket a stranger','Lift a wallet without being caught.','Medium',5,50,0.6,20,10),
+       ('Rob a store','Small store robbery attempt.','Hard',20,200,0.4,60,20)`
+    );
+  }
+
+  // Ranks table
   await pool.query(`CREATE TABLE IF NOT EXISTS ranks (
     id SERIAL PRIMARY KEY,
     name TEXT,
     xp_required INTEGER
   )`);
 
-  await pool.query(`CREATE TABLE IF NOT EXISTS investments (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER REFERENCES users(id),
-    type TEXT,
-    amount INTEGER,
-    return_percent REAL,
-    risk REAL,
-    complete_at TIMESTAMP,
-    collected BOOLEAN DEFAULT false
-  )`);
-
-  // Seed ranks if empty
-  const rankCount = await pool.query("SELECT COUNT(*) FROM ranks");
-  if (parseInt(rankCount.rows[0].count) === 0) {
+  const rcount = await pool.query("SELECT COUNT(*) FROM ranks");
+  if (parseInt(rcount.rows[0].count) === 0) {
     await pool.query(
       `INSERT INTO ranks (name, xp_required) VALUES
-      ('Street Thug', 0),
-      ('Gangster', 100),
-      ('Capo', 500),
-      ('Boss', 2000),
-      ('Don', 5000),
-      ('Godfather', 10000)`
+      ('Rookie', 0),
+      ('Thug', 100),
+      ('Enforcer', 300),
+      ('Capo', 700),
+      ('Underboss', 1500),
+      ('Boss', 3000)`
     );
   }
 }
+
 initDB();
 
-// === Helper: Rank Update ===
-async function updateUserRank(userId) {
-  const userRes = await pool.query("SELECT xp FROM users WHERE id=$1", [userId]);
-  if (userRes.rows.length === 0) return;
-  const xp = userRes.rows[0].xp;
-  const rankRes = await pool.query(
-    "SELECT name FROM ranks WHERE xp_required <= $1 ORDER BY xp_required DESC LIMIT 1",
-    [xp]
-  );
-  if (rankRes.rows.length > 0) {
-    const newRank = rankRes.rows[0].name;
-    await pool.query("UPDATE users SET rank=$1 WHERE id=$2", [newRank, userId]);
-  }
-}
-
-// === Auth Routes ===
+// === AUTH ROUTES ===
 app.post("/register", async (req, res) => {
   const { username, password } = req.body;
   try {
     const hashed = await bcrypt.hash(password, 10);
     const result = await pool.query(
-      `INSERT INTO users (username, password) VALUES ($1, $2) RETURNING *`,
+      `INSERT INTO users (username, password) VALUES ($1, $2) RETURNING id, username, role`,
       [username, hashed]
     );
     res.json({ success: true, user: result.rows[0] });
-  } catch {
-    res.status(400).json({ success: false, error: "Username taken" });
+  } catch (err) {
+    res.status(400).json({ error: "Username taken" });
   }
 });
 
 app.post("/login", async (req, res) => {
   const { username, password } = req.body;
-  const result = await pool.query("SELECT * FROM users WHERE username=$1", [username]);
-  if (result.rows.length === 0) return res.json({ success: false, error: "User not found" });
+  const result = await pool.query(`SELECT * FROM users WHERE username = $1`, [username]);
+  if (result.rows.length === 0) return res.status(400).json({ error: "User not found" });
 
   const user = result.rows[0];
   const match = await bcrypt.compare(password, user.password);
-  if (!match) return res.json({ success: false, error: "Invalid password" });
+  if (!match) return res.status(401).json({ error: "Invalid password" });
 
   res.json({ success: true, user });
 });
 
-// === Crimes ===
+// === CRIMES ===
 app.get("/crimes", async (req, res) => {
-  const crimes = await pool.query("SELECT * FROM crimes ORDER BY category, id");
-  res.json(crimes.rows);
+  const result = await pool.query(`SELECT * FROM crimes ORDER BY id ASC`);
+  res.json(result.rows);
 });
 
 app.post("/commit-crime", async (req, res) => {
   const { userId, crimeId } = req.body;
-  const userRes = await pool.query("SELECT * FROM users WHERE id=$1", [userId]);
-  if (userRes.rows.length === 0) return res.json({ success: false, error: "User not found" });
-  const user = userRes.rows[0];
 
-  const crimeRes = await pool.query("SELECT * FROM crimes WHERE id=$1", [crimeId]);
-  if (crimeRes.rows.length === 0) return res.json({ success: false, error: "Crime not found" });
-  const crime = crimeRes.rows[0];
+  const userResult = await pool.query(`SELECT * FROM users WHERE id = $1`, [userId]);
+  if (userResult.rows.length === 0) return res.status(404).json({ error: "User not found" });
+  const user = userResult.rows[0];
 
-  const lastCrimes = user.last_crimes || {};
-  const now = Date.now();
-  const cooldownEnd = lastCrimes[crimeId]
-    ? new Date(lastCrimes[crimeId]).getTime() + crime.cooldown_seconds * 1000
-    : 0;
-  if (now < cooldownEnd) return res.json({ success: false, message: "Crime cooling down" });
+  if (user.jail_until && new Date(user.jail_until) > new Date()) {
+    return res.json({ success: false, message: "You are in jail!", jail_until: user.jail_until });
+  }
+
+  const crimeResult = await pool.query(`SELECT * FROM crimes WHERE id = $1`, [crimeId]);
+  if (crimeResult.rows.length === 0) return res.status(404).json({ error: "Crime not found" });
+  const crime = crimeResult.rows[0];
+
+  const cooldown = await pool.query(
+    `SELECT * FROM user_crime_cooldowns WHERE user_id = $1 AND crime_id = $2`,
+    [userId, crimeId]
+  );
+
+  if (cooldown.rows.length > 0) {
+    const lastAttempt = new Date(cooldown.rows[0].last_attempt);
+    if (lastAttempt.getTime() + crime.cooldown_seconds * 1000 > Date.now()) {
+      const waitTime = Math.ceil(
+        (lastAttempt.getTime() + crime.cooldown_seconds * 1000 - Date.now()) / 1000
+      );
+      return res.json({ success: false, message: `Wait ${waitTime}s before retrying.` });
+    }
+  }
 
   const success = Math.random() < crime.success_rate;
-  let reward = 0, jailUntil = null;
+  let reward = 0;
+  let jail_until = null;
 
   if (success) {
     reward = Math.floor(Math.random() * (crime.max_reward - crime.min_reward + 1)) + crime.min_reward;
-    const clean = Math.floor(reward * 0.5);
-    const dirty = reward - clean;
-
     await pool.query(
-      `UPDATE users SET pocket_money=pocket_money+$1, dirty_money=dirty_money+$2, xp=xp+$3,
-       total_crimes=total_crimes+1, successful_crimes=successful_crimes+1,
-       last_crimes=jsonb_set(last_crimes, $4, to_jsonb(NOW()), true) WHERE id=$5`,
-      [clean, dirty, crime.xp_reward || 5, `{${crimeId}}`, userId]
+      `UPDATE users 
+       SET money = money + $1, xp = xp + $2, total_crimes = total_crimes + 1, successful_crimes = successful_crimes + 1
+       WHERE id = $3`,
+      [reward, crime.xp_reward, userId]
     );
   } else {
-    jailUntil = new Date(now + crime.cooldown_seconds * 1000);
+    jail_until = new Date(Date.now() + crime.cooldown_seconds * 1000);
     await pool.query(
-      `UPDATE users SET xp=xp+1, total_crimes=total_crimes+1, unsuccessful_crimes=unsuccessful_crimes+1,
-       jail_until=$1, last_crimes=jsonb_set(last_crimes, $2, to_jsonb(NOW()), true) WHERE id=$3`,
-      [jailUntil, `{${crimeId}}`, userId]
+      `UPDATE users 
+       SET total_crimes = total_crimes + 1, unsuccessful_crimes = unsuccessful_crimes + 1, jail_until = $1
+       WHERE id = $2`,
+      [jail_until, userId]
     );
   }
 
-  await updateUserRank(userId);
-  const updatedUser = await pool.query("SELECT * FROM users WHERE id=$1", [userId]);
-  res.json({ success, reward, jail_until: jailUntil, user: updatedUser.rows[0] });
+  await pool.query(
+    `INSERT INTO user_crime_cooldowns (user_id, crime_id, last_attempt)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (user_id, crime_id) DO UPDATE SET last_attempt = NOW()`,
+    [userId, crimeId]
+  );
+
+  const updatedUser = await pool.query(`SELECT * FROM users WHERE id = $1`, [userId]);
+
+  res.json({
+    success,
+    reward,
+    message: success
+      ? `You earned $${reward}!`
+      : `You failed and are jailed for ${crime.cooldown_seconds} seconds.`,
+    user: updatedUser.rows[0]
+  });
 });
 
-// === Bank 2.0 ===
+// === BANK ===
 app.post("/bank/deposit", async (req, res) => {
   const { userId, amount } = req.body;
-  const fee = Math.floor(amount * 0.05);
   await pool.query(
-    `UPDATE users SET pocket_money=pocket_money-$1, bank_money=bank_money+($1-$2)
-     WHERE id=$3 AND pocket_money >= $1`,
-    [amount, fee, userId]
+    `UPDATE users SET money = money - $1, bank = bank + $1 WHERE id = $2 AND money >= $1`,
+    [amount, userId]
   );
-  res.json({ success: true, message: `Deposited $${amount} (5% fee taken)` });
+  res.json({ success: true, message: "Deposit complete" });
 });
 
 app.post("/bank/withdraw", async (req, res) => {
   const { userId, amount } = req.body;
   await pool.query(
-    `UPDATE users SET pocket_money=pocket_money+$1, bank_money=bank_money-$1
-     WHERE id=$2 AND bank_money >= $1`,
+    `UPDATE users SET money = money + $1, bank = bank - $1 WHERE id = $2 AND bank >= $1`,
     [amount, userId]
   );
-  res.json({ success: true, message: `Withdrew $${amount}` });
+  res.json({ success: true, message: "Withdraw complete" });
 });
 
-app.post("/bank/launder", async (req, res) => {
-  const { userId, amount } = req.body;
-  const fee = Math.floor(amount * 0.1);
-  await pool.query(
-    `UPDATE users SET dirty_money=dirty_money-$1, bank_money=bank_money+($1-$2)
-     WHERE id=$3 AND dirty_money >= $1`,
-    [amount, fee, userId]
-  );
-  res.json({ success: true, message: `Laundered $${amount} dirty money (10% fee)` });
-});
-
-// === Garage ===
-app.get("/garage/:userId", async (req, res) => {
-  const cars = await pool.query("SELECT * FROM cars");
-  res.json(cars.rows);
-});
-
-// === Rankings ===
-app.get("/rankings", async (req, res) => {
-  const top = await pool.query("SELECT username, xp, pocket_money, bank_money, rank FROM users ORDER BY xp DESC, bank_money DESC LIMIT 20");
-  res.json(top.rows);
-});
-
-// === Admin Middleware ===
-async function requireRole(req, res, next, allowedRoles) {
-  const { userId } = req.body;
-  const userRes = await pool.query("SELECT role FROM users WHERE id=$1", [userId]);
-  if (userRes.rows.length === 0) return res.status(403).json({ error: "Invalid user" });
-  const role = userRes.rows[0].role;
-  if (!allowedRoles.includes(role)) return res.status(403).json({ error: "Permission denied" });
-  next();
-}
-
-// === Admin Routes ===
-app.post("/admin/give-money", async (req, res, next) => {
-  await requireRole(req, res, next, ["admin"]);
-}, async (req, res) => {
-  const { targetId, amount } = req.body;
-  await pool.query("UPDATE users SET pocket_money=pocket_money+$1 WHERE id=$2", [amount, targetId]);
-  res.json({ success: true, message: `Gave $${amount} to user ${targetId}` });
-});
-
-app.post("/admin/jail-user", async (req, res, next) => {
-  await requireRole(req, res, next, ["admin", "mod"]);
-}, async (req, res) => {
-  const { targetId, minutes } = req.body;
-  const jailUntil = new Date(Date.now() + minutes * 60 * 1000);
-  await pool.query("UPDATE users SET jail_until=$1 WHERE id=$2", [jailUntil, targetId]);
-  res.json({ success: true, message: `User jailed until ${jailUntil}` });
-});
-
-app.post("/admin/release-user", async (req, res, next) => {
-  await requireRole(req, res, next, ["admin", "mod"]);
-}, async (req, res) => {
-  const { targetId } = req.body;
-  await pool.query("UPDATE users SET jail_until=NULL WHERE id=$1", [targetId]);
-  res.json({ success: true, message: `User ${targetId} released from jail` });
-});
-
-app.post("/admin/edit-crime", async (req, res, next) => {
-  await requireRole(req, res, next, ["admin"]);
-}, async (req, res) => {
-  const { crimeId, min_reward, max_reward, success_rate, cooldown_seconds } = req.body;
-  await pool.query(
-    `UPDATE crimes SET min_reward=$1, max_reward=$2, success_rate=$3, cooldown_seconds=$4 WHERE id=$5`,
-    [min_reward, max_reward, success_rate, cooldown_seconds, crimeId]
-  );
-  res.json({ success: true, message: `Crime ${crimeId} updated` });
-});
-
-app.post("/admin/set-tax", async (req, res, next) => {
-  await requireRole(req, res, next, ["admin"]);
-}, async (req, res) => {
-  const { taxRate } = req.body;
-  res.json({ success: true, message: `Global tax rate set to ${taxRate}%` });
-});
-
-// === NEW Admin Endpoints for UI ===
+// === ADMIN ROUTES ===
 app.get("/admin/users", async (req, res) => {
-  const { query } = req.query;
-  let sql = `SELECT id, username, role, pocket_money, bank_money, dirty_money, xp, rank, jail_until
-             FROM users`;
-  const params = [];
-  if (query) {
-    sql += ` WHERE CAST(id AS TEXT) ILIKE $1 OR username ILIKE $1 OR role ILIKE $1`;
-    params.push(`%${query}%`);
-  }
-  sql += ` ORDER BY id ASC LIMIT 200`;
-  const r = await pool.query(sql, params);
-  res.json(r.rows);
+  const result = await pool.query(`SELECT id, username, role, money FROM users ORDER BY id ASC`);
+  res.json(result.rows);
 });
 
 app.get("/admin/crimes", async (req, res) => {
-  const r = await pool.query(`SELECT id, name, category, min_reward, max_reward, success_rate, cooldown_seconds FROM crimes ORDER BY category, id`);
-  res.json(r.rows);
+  const result = await pool.query(`SELECT * FROM crimes ORDER BY id ASC`);
+  res.json(result.rows);
 });
 
-app.post("/admin/set-role", async (req, res, next) => {
-  await requireRole(req, res, next, ["admin"]);
-}, async (req, res) => {
-  const { targetId, role } = req.body;
-  if (!["player", "mod", "admin"].includes(role)) {
-    return res.status(400).json({ success: false, error: "Invalid role" });
+app.post("/admin/give-money", async (req, res) => {
+  const { userId, targetId, amount } = req.body;
+  const admin = await pool.query(`SELECT role FROM users WHERE id = $1`, [userId]);
+  if (!admin.rows[0] || !["admin", "mod"].includes(admin.rows[0].role)) {
+    return res.status(403).json({ success: false, message: "Not authorized" });
   }
-  await pool.query("UPDATE users SET role=$1 WHERE id=$2", [role, targetId]);
-  res.json({ success: true, message: `User ${targetId} is now ${role}` });
+  await pool.query(`UPDATE users SET money = money + $1 WHERE id = $2`, [amount, targetId]);
+  res.json({ success: true, message: `Gave $${amount} to user ${targetId}` });
 });
 
-// === Root ===
-app.get("/", (req, res) => res.send("✅ Mafia API Running with Crimes + Bank 2.0 + Admin Panel"));
+app.post("/admin/jail-user", async (req, res) => {
+  const { targetId, minutes } = req.body;
+  const jailUntil = new Date(Date.now() + minutes * 60000);
+  await pool.query(`UPDATE users SET jail_until = $1 WHERE id = $2`, [jailUntil, targetId]);
+  res.json({ success: true, message: `User jailed for ${minutes} minutes.` });
+});
 
-app.listen(4000, () => console.log("🚀 Server running on http://localhost:4000"));
+app.post("/admin/release-user", async (req, res) => {
+  const { targetId } = req.body;
+  await pool.query(`UPDATE users SET jail_until = NULL WHERE id = $1`, [targetId]);
+  res.json({ success: true, message: `User released.` });
+});
+
+app.post("/admin/set-role", async (req, res) => {
+  const { userId, targetId, role } = req.body;
+  const admin = await pool.query(`SELECT role FROM users WHERE id = $1`, [userId]);
+  if (!admin.rows[0] || admin.rows[0].role !== "admin") {
+    return res.status(403).json({ success: false, message: "Only admins can change roles." });
+  }
+  await pool.query(`UPDATE users SET role = $1 WHERE id = $2`, [role, targetId]);
+  res.json({ success: true, message: `User role updated to ${role}` });
+});
+
+// === ROOT ===
+app.get("/", (req, res) => {
+  res.send("✅ Mafia Game API running. Try /crimes");
+});
+
+app.listen(4000, () => console.log("Server running on http://localhost:4000"));
+
+
